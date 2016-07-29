@@ -278,22 +278,23 @@ void SpirvShaderTranslator::StartTranslation() {
     b.addDecoration(pos_, spv::Decoration::DecorationBuiltIn,
                     spv::BuiltIn::BuiltInPosition);
 
-    vertex_id_ = b.createVariable(spv::StorageClass::StorageClassInput,
-                                  int_type_, "gl_VertexId");
-    b.addDecoration(vertex_id_, spv::Decoration::DecorationBuiltIn,
-                    spv::BuiltIn::BuiltInVertexId);
+    vertex_idx_ = b.createVariable(spv::StorageClass::StorageClassInput,
+                                   int_type_, "gl_VertexIndex");
+    b.addDecoration(vertex_idx_, spv::Decoration::DecorationBuiltIn,
+                    spv::BuiltIn::BuiltInVertexIndex);
 
     interface_ids_.push_back(interpolators_);
     interface_ids_.push_back(pos_);
-    interface_ids_.push_back(vertex_id_);
+    interface_ids_.push_back(vertex_idx_);
 
-    auto vertex_id = b.createLoad(vertex_id_);
-    vertex_id = b.createUnaryOp(spv::Op::OpConvertSToF, float_type_, vertex_id);
+    auto vertex_idx = b.createLoad(vertex_idx_);
+    vertex_idx =
+        b.createUnaryOp(spv::Op::OpConvertSToF, float_type_, vertex_idx);
     auto r0_ptr = b.createAccessChain(spv::StorageClass::StorageClassFunction,
                                       registers_ptr_,
                                       std::vector<Id>({b.makeUintConstant(0)}));
     auto r0 = b.createLoad(r0_ptr);
-    r0 = b.createCompositeInsert(vertex_id, r0, vec4_float_type_,
+    r0 = b.createCompositeInsert(vertex_idx, r0, vec4_float_type_,
                                  std::vector<uint32_t>({0}));
     b.createStore(r0, r0_ptr);
   } else {
@@ -840,6 +841,10 @@ void SpirvShaderTranslator::ProcessAllocInstruction(
     } break;
     // Also PS Colors
     case AllocType::kVsInterpolators: {
+      // Already included, nothing to do here.
+    } break;
+    case AllocType::kMemory: {
+      assert_always();
     } break;
     default:
       break;
@@ -853,7 +858,7 @@ void SpirvShaderTranslator::ProcessVertexFetchInstruction(
     const ParsedVertexFetchInstruction& instr) {
   auto& b = *builder_;
   assert_true(is_vertex_shader());
-  assert_not_zero(vertex_id_);
+  assert_not_zero(vertex_idx_);
 
   // Close the open predicated block if this instr isn't predicated or the
   // conditions do not match.
@@ -885,10 +890,9 @@ void SpirvShaderTranslator::ProcessVertexFetchInstruction(
   // Operand 0 is the index
   // Operand 1 is the binding
   // TODO: Indexed fetch
-  auto vertex_id = LoadFromOperand(instr.operands[0]);
-  vertex_id = b.createCompositeExtract(vertex_id, float_type_, 0);
-  vertex_id = b.createUnaryOp(spv::Op::OpConvertFToS, int_type_, vertex_id);
-  auto shader_vertex_id = b.createLoad(vertex_id_);
+  auto vertex_idx = LoadFromOperand(instr.operands[0]);
+  vertex_idx = b.createUnaryOp(spv::Op::OpConvertFToS, int_type_, vertex_idx);
+  auto shader_vertex_idx = b.createLoad(vertex_idx_);
 
   // Skip loading if it's an indexed fetch.
   auto vertex_ptr = vertex_binding_map_[instr.operands[1].storage_index]
@@ -896,8 +900,8 @@ void SpirvShaderTranslator::ProcessVertexFetchInstruction(
   assert_not_zero(vertex_ptr);
   auto vertex = b.createLoad(vertex_ptr);
 
-  auto cond =
-      b.createBinOp(spv::Op::OpIEqual, bool_type_, vertex_id, shader_vertex_id);
+  auto cond = b.createBinOp(spv::Op::OpIEqual, bool_type_, vertex_idx,
+                            shader_vertex_idx);
   auto vertex_components = b.getNumComponents(vertex);
   Id alt_vertex = 0;
   switch (vertex_components) {
@@ -1025,6 +1029,20 @@ void SpirvShaderTranslator::ProcessTextureFetchInstruction(
           b.createAccessChain(spv::StorageClass::StorageClassUniformConstant,
                               tex_[dim_idx], std::vector<Id>({texture_index}));
       auto texture = b.createLoad(texture_ptr);
+
+      if (instr.dimension == TextureDimension::k1D &&
+          (instr.attributes.offset_x)) {
+        auto offset = b.makeFloatConstant(instr.attributes.offset_x + 0.5f);
+        src = b.createBinOp(spv::Op::OpFAdd, float_type_, src, offset);
+      } else if (instr.dimension == TextureDimension::k2D &&
+                 (instr.attributes.offset_x || instr.attributes.offset_y)) {
+        auto offset = b.makeCompositeConstant(
+            vec2_float_type_,
+            std::vector<Id>(
+                {b.makeFloatConstant(instr.attributes.offset_x + 0.5f),
+                 b.makeFloatConstant(instr.attributes.offset_y + 0.5f)}));
+        src = b.createBinOp(spv::Op::OpFAdd, vec2_float_type_, src, offset);
+      }
 
       spv::Builder::TextureParameters params = {0};
       params.coords = src;
@@ -1698,6 +1716,7 @@ void SpirvShaderTranslator::ProcessVectorAluInstruction(
   }
 
   assert_not_zero(dest);
+  assert_true(b.getTypeId(dest) == vec4_float_type_);
   if (dest) {
     b.createStore(dest, pv_);
     StoreToResult(dest, instr.result);
@@ -1723,32 +1742,12 @@ void SpirvShaderTranslator::ProcessScalarAluInstruction(
     auto src = LoadFromOperand(instr.operands[i]);
 
     // Pull components out of the vector operands and use them as sources.
-    for (size_t j = 0; j < instr.operands[i].component_count; j++) {
-      uint32_t component = 0;
-      switch (instr.operands[i].components[j]) {
-        case SwizzleSource::kX:
-          component = 0;
-          break;
-        case SwizzleSource::kY:
-          component = 1;
-          break;
-        case SwizzleSource::kZ:
-          component = 2;
-          break;
-        case SwizzleSource::kW:
-          component = 3;
-          break;
-        case SwizzleSource::k0:
-        case SwizzleSource::k1:
-          // Don't believe this can happen.
-          assert_always();
-          break;
-        default:
-          assert_always();
-          break;
+    if (instr.operands[i].component_count > 1) {
+      for (int j = 0; j < instr.operands[i].component_count; j++) {
+        sources[x++] = b.createCompositeExtract(src, float_type_, j);
       }
-
-      sources[x++] = b.createCompositeExtract(src, float_type_, component);
+    } else {
+      sources[x++] = src;
     }
   }
 
@@ -2012,15 +2011,17 @@ void SpirvShaderTranslator::ProcessScalarAluInstruction(
       dest = CreateGlslStd450InstructionCall(spv::NoPrecision, float_type_,
                                              spv::GLSLstd450::kInverseSqrt,
                                              {sources[0]});
-      auto c = b.createUnaryOp(spv::Op::OpIsInf, bool_type_, dest);
+      auto c1 = b.createUnaryOp(spv::Op::OpIsInf, bool_type_, dest);
+      auto c2 = b.createUnaryOp(spv::Op::OpIsNan, bool_type_, dest);
+      auto c = b.createBinOp(spv::Op::OpLogicalOr, bool_type_, c1, c2);
       dest = b.createTriOp(spv::Op::OpSelect, float_type_, c,
                            b.makeFloatConstant(0.f), dest);
     } break;
 
     case AluScalarOpcode::kRsq: {
-      // dest = src0 != 0.0 ? inversesqrt(src0) : 0.0;
-      auto c = b.createBinOp(spv::Op::OpFOrdEqual, bool_type_, sources[0],
-                             b.makeFloatConstant(0.f));
+      // dest = src0 > 0.0 ? inversesqrt(src0) : 0.0;
+      auto c = b.createBinOp(spv::Op::OpFOrdLessThanEqual, bool_type_,
+                             sources[0], b.makeFloatConstant(0.f));
       auto d = CreateGlslStd450InstructionCall(spv::NoPrecision, float_type_,
                                                spv::GLSLstd450::kInverseSqrt,
                                                {sources[0]});
@@ -2185,6 +2186,7 @@ void SpirvShaderTranslator::ProcessScalarAluInstruction(
   }
 
   assert_not_zero(dest);
+  assert_true(b.getTypeId(dest) == float_type_);
   if (dest) {
     b.createStore(dest, ps_);
     StoreToResult(dest, instr.result);
@@ -2278,6 +2280,35 @@ Id SpirvShaderTranslator::LoadFromOperand(const InstructionOperand& op) {
   auto storage_value = b.createLoad(storage_pointer);
   assert_true(b.getTypeId(storage_value) == vec4_float_type_);
 
+  if (op.component_count == 1) {
+    // Don't bother handling constant 0/1 fetches, as they're invalid in scalar
+    // opcodes.
+    uint32_t index = 0;
+    switch (op.components[0]) {
+      case SwizzleSource::kX:
+        index = 0;
+        break;
+      case SwizzleSource::kY:
+        index = 1;
+        break;
+      case SwizzleSource::kZ:
+        index = 2;
+        break;
+      case SwizzleSource::kW:
+        index = 3;
+        break;
+      case SwizzleSource::k0:
+        assert_always();
+        break;
+      case SwizzleSource::k1:
+        assert_always();
+        break;
+    }
+
+    storage_value = b.createCompositeExtract(storage_value, float_type_, index);
+    storage_type = float_type_;
+  }
+
   if (op.is_absolute_value) {
     storage_value = CreateGlslStd450InstructionCall(
         spv::NoPrecision, storage_type, GLSLstd450::kFAbs, {storage_value});
@@ -2288,7 +2319,7 @@ Id SpirvShaderTranslator::LoadFromOperand(const InstructionOperand& op) {
   }
 
   // swizzle
-  if (!op.is_standard_swizzle()) {
+  if (op.component_count > 1 && !op.is_standard_swizzle()) {
     std::vector<uint32_t> operands;
     operands.push_back(storage_value);
     operands.push_back(b.makeCompositeConstant(
@@ -2424,7 +2455,7 @@ void SpirvShaderTranslator::StoreToResult(Id source_value_id,
   }
 
   if (!storage_pointer) {
-    // assert_always();
+    assert_always();
     return;
   }
 
@@ -2433,42 +2464,25 @@ void SpirvShaderTranslator::StoreToResult(Id source_value_id,
         b.createAccessChain(storage_class, storage_pointer, storage_offsets);
   }
 
+  bool source_is_scalar = b.isScalar(source_value_id);
+  bool storage_is_scalar = b.isScalarType(b.getDerefTypeId(storage_pointer));
+  spv::Id source_type = b.getTypeId(source_value_id);
+
   // Only load from storage if we need it later.
   Id storage_value = 0;
-  if (!result.has_all_writes()) {
+  if ((source_is_scalar && !storage_is_scalar) || !result.has_all_writes()) {
     storage_value = b.createLoad(storage_pointer);
   }
 
   // Clamp the input value.
   if (result.is_clamped) {
     source_value_id = CreateGlslStd450InstructionCall(
-        spv::NoPrecision, b.getTypeId(source_value_id),
-        spv::GLSLstd450::kFClamp,
+        spv::NoPrecision, source_type, spv::GLSLstd450::kFClamp,
         {source_value_id, b.makeFloatConstant(0.0), b.makeFloatConstant(1.0)});
   }
 
-  // Convert to the appropriate type, if needed.
-  if (b.getTypeId(source_value_id) != storage_type) {
-    std::vector<Id> constituents;
-    auto n_el = b.getNumComponents(source_value_id);
-    auto n_dst = b.getNumTypeComponents(storage_type);
-
-    if (n_el != 1) {
-      std::vector<uint32_t> channels;
-      for (int i = 0; i < n_dst; i++) {
-        channels.push_back(i % n_el);
-      }
-
-      source_value_id = b.createRvalueSwizzle(spv::NoPrecision, storage_type,
-                                              source_value_id, channels);
-    } else {
-      source_value_id =
-          b.smearScalar(spv::NoPrecision, source_value_id, storage_type);
-    }
-  }
-
   // swizzle
-  if (!result.is_standard_swizzle()) {
+  if (!result.is_standard_swizzle() && !source_is_scalar) {
     std::vector<uint32_t> operands;
     operands.push_back(source_value_id);
     operands.push_back(b.makeCompositeConstant(
@@ -2477,6 +2491,7 @@ void SpirvShaderTranslator::StoreToResult(Id source_value_id,
 
     // Components start from left and are duplicated rightwards
     // e.g. count = 1, xxxx / count = 2, xyyy ...
+    uint32_t source_components = b.getNumComponents(source_value_id);
     for (int i = 0; i < b.getNumTypeComponents(storage_type); i++) {
       if (!result.write_mask[i]) {
         // Undefined / don't care.
@@ -2499,10 +2514,10 @@ void SpirvShaderTranslator::StoreToResult(Id source_value_id,
           operands.push_back(3);
           break;
         case SwizzleSource::k0:
-          operands.push_back(4);
+          operands.push_back(source_components + 0);
           break;
         case SwizzleSource::k1:
-          operands.push_back(5);
+          operands.push_back(source_components + 1);
           break;
       }
     }
@@ -2512,7 +2527,7 @@ void SpirvShaderTranslator::StoreToResult(Id source_value_id,
   }
 
   // write mask
-  if (!result.has_all_writes()) {
+  if (!result.has_all_writes() && !source_is_scalar) {
     std::vector<uint32_t> operands;
     operands.push_back(source_value_id);
     operands.push_back(storage_value);
@@ -2524,6 +2539,24 @@ void SpirvShaderTranslator::StoreToResult(Id source_value_id,
 
     source_value_id =
         b.createOp(spv::Op::OpVectorShuffle, storage_type, operands);
+  } else if (source_is_scalar && !storage_is_scalar) {
+    assert_true(result.num_writes() >= 1);
+
+    if (result.has_all_writes()) {
+      source_value_id =
+          b.smearScalar(spv::NoPrecision, source_value_id, storage_type);
+    } else {
+      // Find first enabled component
+      uint32_t index = 0;
+      for (uint32_t i = 0; i < 4; i++) {
+        if (result.write_mask[i]) {
+          index = i;
+          break;
+        }
+      }
+      source_value_id = b.createCompositeInsert(source_value_id, storage_value,
+                                                storage_type, index);
+    }
   }
 
   // Perform store into the pointer.
