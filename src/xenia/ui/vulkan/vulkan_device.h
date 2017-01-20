@@ -75,6 +75,12 @@ class VulkanDevice {
   // This method is thread safe.
   void ReleaseQueue(VkQueue queue);
 
+  static void DbgSetObjectName(VkDevice device, uint64_t object,
+                               VkDebugReportObjectTypeEXT object_type,
+                               std::string name);
+  void DbgSetObjectName(uint64_t object, VkDebugReportObjectTypeEXT object_type,
+                        std::string name);
+
   // True if RenderDoc is attached and available for use.
   bool is_renderdoc_attached() const;
   // Begins capturing the current frame in RenderDoc, if it is attached.

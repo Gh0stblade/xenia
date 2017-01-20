@@ -36,26 +36,30 @@ class EmulatorWindow {
   ui::Window* window() const { return window_.get(); }
 
   void UpdateTitle();
+  void ToggleFullscreen();
 
  private:
   explicit EmulatorWindow(Emulator* emulator);
 
   bool Initialize();
 
+  void FileDrop(wchar_t* filename);
   void FileOpen();
+  void FileClose();
+  void CheckHideCursor();
   void CpuTimeScalarReset();
   void CpuTimeScalarSetHalf();
   void CpuTimeScalarSetDouble();
   void CpuBreakIntoDebugger();
   void GpuTraceFrame();
   void GpuClearCaches();
-  void ToggleFullscreen();
   void ShowHelpWebsite();
 
   Emulator* emulator_;
   std::unique_ptr<ui::Loop> loop_;
   std::unique_ptr<ui::Window> window_;
   std::wstring base_title_;
+  uint64_t cursor_hide_time_ = 0;
 };
 
 }  // namespace app

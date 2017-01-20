@@ -65,7 +65,7 @@ VkFormat DepthRenderTargetFormatToVkFormat(DepthRenderTargetFormat format) {
     case DepthRenderTargetFormat::kD24FS8:
       // TODO(benvanik): some way to emulate? resolve-time flag?
       XELOGW("Unsupported EDRAM format kD24FS8 used");
-      return VK_FORMAT_D24_UNORM_S8_UINT;
+      return VK_FORMAT_D32_SFLOAT_S8_UINT;
     default:
       return VK_FORMAT_UNDEFINED;
   }
@@ -198,6 +198,11 @@ CachedTileView::CachedTileView(ui::vulkan::VulkanDevice* device,
   image_info.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
   auto err = vkCreateImage(device_, &image_info, nullptr, &image);
   CheckResult(err, "vkCreateImage");
+
+  device->DbgSetObjectName(
+      reinterpret_cast<uint64_t>(image), VK_DEBUG_REPORT_OBJECT_TYPE_IMAGE_EXT,
+      xe::format_string("%.8X pitch %.8X(%d)", key.tile_offset, key.tile_width,
+                        key.tile_width));
 
   VkMemoryRequirements memory_requirements;
   vkGetImageMemoryRequirements(*device, image, &memory_requirements);
@@ -394,9 +399,6 @@ CachedRenderPass::CachedRenderPass(VkDevice device,
   depth_stencil_attachment.stencilStoreOp = VK_ATTACHMENT_STORE_OP_STORE;
   depth_stencil_attachment.initialLayout = VK_IMAGE_LAYOUT_GENERAL;
   depth_stencil_attachment.finalLayout = VK_IMAGE_LAYOUT_GENERAL;
-  VkAttachmentReference depth_stencil_attachment_ref;
-  depth_stencil_attachment_ref.attachment = VK_ATTACHMENT_UNUSED;
-  depth_stencil_attachment_ref.layout = VK_IMAGE_LAYOUT_GENERAL;
 
   // Configure attachments based on what's enabled.
   VkAttachmentReference color_attachment_refs[4];
@@ -409,6 +411,11 @@ CachedRenderPass::CachedRenderPass(VkDevice device,
     color_attachment_ref.attachment = i;
     color_attachment_ref.layout = VK_IMAGE_LAYOUT_GENERAL;
   }
+
+  // Configure depth.
+  VkAttachmentReference depth_stencil_attachment_ref;
+  depth_stencil_attachment_ref.layout = VK_IMAGE_LAYOUT_GENERAL;
+
   auto& depth_config = config.depth_stencil;
   depth_stencil_attachment_ref.attachment = 4;
   depth_stencil_attachment.format =
@@ -435,8 +442,21 @@ CachedRenderPass::CachedRenderPass(VkDevice device,
   render_pass_info.pAttachments = attachments;
   render_pass_info.subpassCount = 1;
   render_pass_info.pSubpasses = &subpass_info;
-  render_pass_info.dependencyCount = 0;
-  render_pass_info.pDependencies = nullptr;
+
+  // Add a dependency on external render passes -> us (MAY_ALIAS bit)
+  VkSubpassDependency dependencies[1];
+  dependencies[0].srcSubpass = VK_SUBPASS_EXTERNAL;
+  dependencies[0].dstSubpass = 0;
+  dependencies[0].srcStageMask = VK_PIPELINE_STAGE_ALL_GRAPHICS_BIT;
+  dependencies[0].dstStageMask = VK_PIPELINE_STAGE_ALL_GRAPHICS_BIT;
+  dependencies[0].srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT |
+                                  VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+  dependencies[0].dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT |
+                                  VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+  dependencies[0].dependencyFlags = 0;
+
+  render_pass_info.dependencyCount = 1;
+  render_pass_info.pDependencies = dependencies;
   auto err = vkCreateRenderPass(device_, &render_pass_info, nullptr, &handle);
   CheckResult(err, "vkCreateRenderPass");
 }

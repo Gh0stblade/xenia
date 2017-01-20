@@ -64,10 +64,12 @@ void SpirvShaderTranslator::StartTranslation() {
   float_type_ = b.makeFloatType(32);
   int_type_ = b.makeIntType(32);
   uint_type_ = b.makeUintType(32);
+  vec2_int_type_ = b.makeVectorType(int_type_, 2);
   vec2_uint_type_ = b.makeVectorType(uint_type_, 2);
   vec2_float_type_ = b.makeVectorType(float_type_, 2);
   vec3_float_type_ = b.makeVectorType(float_type_, 3);
   vec4_float_type_ = b.makeVectorType(float_type_, 4);
+  vec4_int_type_ = b.makeVectorType(int_type_, 4);
   vec4_uint_type_ = b.makeVectorType(uint_type_, 4);
   vec2_bool_type_ = b.makeVectorType(bool_type_, 2);
   vec3_bool_type_ = b.makeVectorType(bool_type_, 3);
@@ -103,6 +105,8 @@ void SpirvShaderTranslator::StartTranslation() {
                          "ps");
   pv_ = b.createVariable(spv::StorageClass::StorageClassFunction,
                          vec4_float_type_, "pv");
+  pc_ = b.createVariable(spv::StorageClass::StorageClassFunction, int_type_,
+                         "pc");
   a0_ = b.createVariable(spv::StorageClass::StorageClassFunction, int_type_,
                          "a0");
 
@@ -151,9 +155,10 @@ void SpirvShaderTranslator::StartTranslation() {
   }
 
   // Push constants, represented by SpirvPushConstants.
-  Id push_constants_type = b.makeStructType(
-      {vec4_float_type_, vec4_float_type_, vec4_float_type_, uint_type_},
-      "push_consts_type");
+  Id push_constants_type =
+      b.makeStructType({vec4_float_type_, vec4_float_type_, vec4_float_type_,
+                        vec4_float_type_, uint_type_},
+                       "push_consts_type");
   b.addDecoration(push_constants_type, spv::Decoration::DecorationBlock);
 
   // float4 window_scale;
@@ -166,16 +171,21 @@ void SpirvShaderTranslator::StartTranslation() {
       push_constants_type, 1, spv::Decoration::DecorationOffset,
       static_cast<int>(offsetof(SpirvPushConstants, vtx_fmt)));
   b.addMemberName(push_constants_type, 1, "vtx_fmt");
-  // float4 alpha_test;
+  // float4 vtx_fmt;
   b.addMemberDecoration(
       push_constants_type, 2, spv::Decoration::DecorationOffset,
-      static_cast<int>(offsetof(SpirvPushConstants, alpha_test)));
-  b.addMemberName(push_constants_type, 2, "alpha_test");
-  // uint ps_param_gen;
+      static_cast<int>(offsetof(SpirvPushConstants, point_size)));
+  b.addMemberName(push_constants_type, 2, "point_size");
+  // float4 alpha_test;
   b.addMemberDecoration(
       push_constants_type, 3, spv::Decoration::DecorationOffset,
+      static_cast<int>(offsetof(SpirvPushConstants, alpha_test)));
+  b.addMemberName(push_constants_type, 3, "alpha_test");
+  // uint ps_param_gen;
+  b.addMemberDecoration(
+      push_constants_type, 4, spv::Decoration::DecorationOffset,
       static_cast<int>(offsetof(SpirvPushConstants, ps_param_gen)));
-  b.addMemberName(push_constants_type, 3, "ps_param_gen");
+  b.addMemberName(push_constants_type, 4, "ps_param_gen");
   push_consts_ = b.createVariable(spv::StorageClass::StorageClassPushConstant,
                                   push_constants_type, "push_consts");
 
@@ -219,6 +229,8 @@ void SpirvShaderTranslator::StartTranslation() {
     for (const auto& binding : vertex_bindings()) {
       for (const auto& attrib : binding.attributes) {
         Id attrib_type = 0;
+        bool is_signed = attrib.fetch_instr.attributes.is_signed;
+        bool is_integer = attrib.fetch_instr.attributes.is_integer;
         switch (attrib.fetch_instr.attributes.data_format) {
           case VertexFormat::k_32:
           case VertexFormat::k_32_FLOAT:
@@ -226,22 +238,35 @@ void SpirvShaderTranslator::StartTranslation() {
             break;
           case VertexFormat::k_16_16:
           case VertexFormat::k_32_32:
+            if (is_integer) {
+              attrib_type = is_signed ? vec2_int_type_ : vec2_uint_type_;
+              break;
+            }
           case VertexFormat::k_16_16_FLOAT:
           case VertexFormat::k_32_32_FLOAT:
             attrib_type = vec2_float_type_;
             break;
-          case VertexFormat::k_10_11_11:
-          case VertexFormat::k_11_11_10:
           case VertexFormat::k_32_32_32_FLOAT:
             attrib_type = vec3_float_type_;
             break;
-          case VertexFormat::k_8_8_8_8:
           case VertexFormat::k_2_10_10_10:
+            attrib_type = vec4_float_type_;
+            break;
+          case VertexFormat::k_8_8_8_8:
           case VertexFormat::k_16_16_16_16:
           case VertexFormat::k_32_32_32_32:
+            if (is_integer) {
+              attrib_type = is_signed ? vec4_int_type_ : vec4_uint_type_;
+              break;
+            }
           case VertexFormat::k_16_16_16_16_FLOAT:
           case VertexFormat::k_32_32_32_32_FLOAT:
             attrib_type = vec4_float_type_;
+            break;
+          case VertexFormat::k_10_11_11:
+          case VertexFormat::k_11_11_10:
+            // Manually converted.
+            attrib_type = is_signed ? int_type_ : uint_type_;
             break;
           default:
             assert_always();
@@ -273,6 +298,24 @@ void SpirvShaderTranslator::StartTranslation() {
       b.createStore(vec4_float_zero_, ptr);
     }
 
+    point_size_ = b.createVariable(spv::StorageClass::StorageClassOutput,
+                                   float_type_, "point_size");
+    b.addDecoration(point_size_, spv::Decoration::DecorationLocation, 17);
+    // Set default point-size value (-1.0f, indicating to the geometry shader
+    // that the register value should be used instead of the per-vertex value)
+    b.createStore(b.makeFloatConstant(-1.0f), point_size_);
+
+    point_coord_ = b.createVariable(spv::StorageClass::StorageClassOutput,
+                                    vec2_float_type_, "point_coord");
+    b.addDecoration(point_coord_, spv::Decoration::DecorationLocation, 16);
+    // point_coord is only ever populated in a geometry shader. Just write
+    // zero to it in the vertex shader.
+    b.createStore(
+        b.makeCompositeConstant(vec2_float_type_,
+                                std::vector<Id>({b.makeFloatConstant(0.0f),
+                                                 b.makeFloatConstant(0.0f)})),
+        point_coord_);
+
     pos_ = b.createVariable(spv::StorageClass::StorageClassOutput,
                             vec4_float_type_, "gl_Position");
     b.addDecoration(pos_, spv::Decoration::DecorationBuiltIn,
@@ -284,6 +327,8 @@ void SpirvShaderTranslator::StartTranslation() {
                     spv::BuiltIn::BuiltInVertexIndex);
 
     interface_ids_.push_back(interpolators_);
+    interface_ids_.push_back(point_coord_);
+    interface_ids_.push_back(point_size_);
     interface_ids_.push_back(pos_);
     interface_ids_.push_back(vertex_idx_);
 
@@ -303,6 +348,10 @@ void SpirvShaderTranslator::StartTranslation() {
                                       interpolators_type, "interpolators");
     b.addDecoration(interpolators_, spv::Decoration::DecorationLocation, 0);
 
+    point_coord_ = b.createVariable(spv::StorageClass::StorageClassInput,
+                                    vec2_float_type_, "point_coord");
+    b.addDecoration(point_coord_, spv::Decoration::DecorationLocation, 16);
+
     // Pixel fragment outputs (one per render target).
     Id frag_outputs_type =
         b.makeArrayType(vec4_float_type_, b.makeUintConstant(4), 0);
@@ -316,6 +365,7 @@ void SpirvShaderTranslator::StartTranslation() {
                     spv::BuiltIn::BuiltInFragDepth);
 
     interface_ids_.push_back(interpolators_);
+    interface_ids_.push_back(point_coord_);
     interface_ids_.push_back(frag_outputs_);
     interface_ids_.push_back(frag_depth_);
     // TODO(benvanik): frag depth, etc.
@@ -339,7 +389,7 @@ void SpirvShaderTranslator::StartTranslation() {
     // Setup ps_param_gen
     auto ps_param_gen_idx_ptr = b.createAccessChain(
         spv::StorageClass::StorageClassPushConstant, push_consts_,
-        std::vector<Id>({b.makeUintConstant(3)}));
+        std::vector<Id>({b.makeUintConstant(4)}));
     auto ps_param_gen_idx = b.createLoad(ps_param_gen_idx_ptr);
 
     auto frag_coord = b.createVariable(spv::StorageClass::StorageClassInput,
@@ -347,16 +397,11 @@ void SpirvShaderTranslator::StartTranslation() {
     b.addDecoration(frag_coord, spv::Decoration::DecorationBuiltIn,
                     spv::BuiltIn::BuiltInFragCoord);
 
-    auto point_coord = b.createVariable(spv::StorageClass::StorageClassInput,
-                                        vec2_float_type_, "gl_PointCoord");
-    b.addDecoration(point_coord, spv::Decoration::DecorationBuiltIn,
-                    spv::BuiltIn::BuiltInPointCoord);
     interface_ids_.push_back(frag_coord);
-    interface_ids_.push_back(point_coord);
 
     auto param = b.createOp(
         spv::Op::OpVectorShuffle, vec4_float_type_,
-        {b.createLoad(frag_coord), b.createLoad(point_coord), 0, 1, 4, 5});
+        {b.createLoad(frag_coord), b.createLoad(point_coord_), 0, 1, 4, 5});
     /*
     // TODO: gl_FrontFacing
     auto param_x = b.createCompositeExtract(param, float_type_, 0);
@@ -387,15 +432,44 @@ void SpirvShaderTranslator::StartTranslation() {
 
     ifb.makeEndIf();
   }
+
+  b.createStore(b.makeIntConstant(0x0), pc_);
+
+  loop_head_block_ = &b.makeNewBlock();
+  auto block = &b.makeNewBlock();
+  loop_body_block_ = &b.makeNewBlock();
+  loop_cont_block_ = &b.makeNewBlock();
+  loop_exit_block_ = &b.makeNewBlock();
+  b.createBranch(loop_head_block_);
+
+  // Setup continue block
+  b.setBuildPoint(loop_cont_block_);
+  b.createBranch(loop_head_block_);
+
+  // While loop header block
+  b.setBuildPoint(loop_head_block_);
+  b.createLoopMerge(loop_exit_block_, loop_cont_block_,
+                    spv::LoopControlMask::LoopControlDontUnrollMask);
+  b.createBranch(block);
+
+  // Condition block
+  b.setBuildPoint(block);
+
+  // while (pc != 0xFFFF)
+  auto c = b.createBinOp(spv::Op::OpINotEqual, bool_type_, b.createLoad(pc_),
+                         b.makeIntConstant(0xFFFF));
+  b.createConditionalBranch(c, loop_body_block_, loop_exit_block_);
+  b.setBuildPoint(loop_body_block_);
 }
 
 std::vector<uint8_t> SpirvShaderTranslator::CompleteTranslation() {
   auto& b = *builder_;
 
   assert_false(open_predicated_block_);
-  auto block = &b.makeNewBlock();
-  b.createBranch(block);
+  b.setBuildPoint(loop_exit_block_);
   b.makeReturn(false);
+  exec_cond_ = false;
+  exec_skip_block_ = nullptr;
 
   // main() entry point.
   auto mainFn = b.makeMain();
@@ -410,6 +484,9 @@ std::vector<uint8_t> SpirvShaderTranslator::CompleteTranslation() {
     auto entry = b.addEntryPoint(spv::ExecutionModel::ExecutionModelFragment,
                                  mainFn, "main");
     b.addExecutionMode(mainFn, spv::ExecutionModeOriginUpperLeft);
+
+    // FIXME(DrChat): We need to declare the DepthReplacing execution mode if
+    // we write depth, and we must unconditionally write depth if declared!
 
     for (auto id : interface_ids_) {
       entry->addIdOperand(id);
@@ -465,7 +542,7 @@ std::vector<uint8_t> SpirvShaderTranslator::CompleteTranslation() {
     // Alpha test
     auto alpha_test_ptr = b.createAccessChain(
         spv::StorageClass::StorageClassPushConstant, push_consts_,
-        std::vector<Id>({b.makeUintConstant(2)}));
+        std::vector<Id>({b.makeUintConstant(3)}));
     auto alpha_test = b.createLoad(alpha_test_ptr);
 
     auto alpha_test_enabled =
@@ -527,12 +604,17 @@ std::vector<uint8_t> SpirvShaderTranslator::CompleteTranslation() {
   b.makeReturn(false);
 
   // Compile the spv IR
-  compiler_.Compile(b.getModule());
+  // compiler_.Compile(b.getModule());
 
   std::vector<uint32_t> spirv_words;
   b.dump(spirv_words);
 
   // Cleanup builder.
+  cf_blocks_.clear();
+  loop_head_block_ = nullptr;
+  loop_body_block_ = nullptr;
+  loop_cont_block_ = nullptr;
+  loop_exit_block_ = nullptr;
   builder_.reset();
 
   interface_ids_.clear();
@@ -568,30 +650,73 @@ void SpirvShaderTranslator::PostTranslation(Shader* shader) {
   }
 }
 
-void SpirvShaderTranslator::PreProcessControlFlowInstruction(
-    uint32_t cf_index, const ControlFlowInstruction& instr) {
+void SpirvShaderTranslator::PreProcessControlFlowInstructions(
+    std::vector<ucode::ControlFlowInstruction> instrs) {
   auto& b = *builder_;
 
-  if (cf_blocks_.find(cf_index) == cf_blocks_.end()) {
-    CFBlock block;
-    block.block = &b.makeNewBlock();
-    cf_blocks_[cf_index] = block;
-  } else {
-    cf_blocks_[cf_index].block = &b.makeNewBlock();
+  auto default_block = &b.makeNewBlock();
+  switch_break_block_ = &b.makeNewBlock();
+
+  b.setBuildPoint(default_block);
+  b.createStore(b.makeIntConstant(0xFFFF), pc_);
+  b.createBranch(switch_break_block_);
+
+  b.setBuildPoint(switch_break_block_);
+  b.createBranch(loop_cont_block_);
+
+  // Now setup the switch.
+  default_block->addPredecessor(loop_body_block_);
+  b.setBuildPoint(loop_body_block_);
+
+  cf_blocks_.resize(instrs.size());
+  for (size_t i = 0; i < cf_blocks_.size(); i++) {
+    cf_blocks_[i].block = &b.makeNewBlock();
+    cf_blocks_[i].labelled = false;
   }
 
-  if (instr.opcode() == ControlFlowOpcode::kCondJmp) {
-    auto cf_block = cf_blocks_.find(instr.cond_jmp.address());
-    if (cf_block == cf_blocks_.end()) {
-      CFBlock block;
-      block.prev_dominates = false;
-      cf_blocks_[instr.cond_jmp.address()] = block;
-    } else {
-      cf_block->second.prev_dominates = false;
+  std::vector<uint32_t> operands;
+  operands.push_back(b.createLoad(pc_));       // Selector
+  operands.push_back(default_block->getId());  // Default
+
+  // Always have a case for block 0.
+  operands.push_back(0);
+  operands.push_back(cf_blocks_[0].block->getId());
+  cf_blocks_[0].block->addPredecessor(loop_body_block_);
+  cf_blocks_[0].labelled = true;
+
+  for (size_t i = 0; i < instrs.size(); i++) {
+    auto& instr = instrs[i];
+    if (instr.opcode() == ucode::ControlFlowOpcode::kCondJmp) {
+      uint32_t address = instr.cond_jmp.address();
+      cf_blocks_[address].labelled = true;
+
+      operands.push_back(address);
+      operands.push_back(cf_blocks_[address].block->getId());
+      cf_blocks_[address].block->addPredecessor(loop_body_block_);
+
+      cf_blocks_[i + 1].labelled = true;
+      operands.push_back(uint32_t(i + 1));
+      operands.push_back(cf_blocks_[i + 1].block->getId());
+      cf_blocks_[i + 1].block->addPredecessor(loop_body_block_);
+    } else if (instr.opcode() == ucode::ControlFlowOpcode::kLoopStart) {
+      uint32_t address = instr.loop_start.address();
+      cf_blocks_[address].labelled = true;
+
+      operands.push_back(address);
+      operands.push_back(cf_blocks_[address].block->getId());
+      cf_blocks_[address].block->addPredecessor(loop_body_block_);
+    } else if (instr.opcode() == ucode::ControlFlowOpcode::kLoopEnd) {
+      uint32_t address = instr.loop_end.address();
+      cf_blocks_[address].labelled = true;
+
+      operands.push_back(address);
+      operands.push_back(cf_blocks_[address].block->getId());
+      cf_blocks_[address].block->addPredecessor(loop_body_block_);
     }
-  } else if (instr.opcode() == ControlFlowOpcode::kLoopStart) {
-    // TODO
   }
+
+  b.createSelectionMerge(switch_break_block_, 0);
+  b.createNoResultOp(spv::Op::OpSwitch, operands);
 }
 
 void SpirvShaderTranslator::ProcessLabel(uint32_t cf_index) {
@@ -601,11 +726,6 @@ void SpirvShaderTranslator::ProcessLabel(uint32_t cf_index) {
 void SpirvShaderTranslator::ProcessControlFlowInstructionBegin(
     uint32_t cf_index) {
   auto& b = *builder_;
-
-  if (cf_index == 0) {
-    // Kind of cheaty, but emit a branch to the first block.
-    b.createBranch(cf_blocks_[cf_index].block);
-  }
 }
 
 void SpirvShaderTranslator::ProcessControlFlowInstructionEnd(
@@ -613,10 +733,18 @@ void SpirvShaderTranslator::ProcessControlFlowInstructionEnd(
   auto& b = *builder_;
 }
 
-void SpirvShaderTranslator::ProcessControlFlowNopInstruction() {
+void SpirvShaderTranslator::ProcessControlFlowNopInstruction(
+    uint32_t cf_index) {
   auto& b = *builder_;
 
-  // b.createNoResultOp(spv::Op::OpNop);
+  auto head = cf_blocks_[cf_index].block;
+  b.setBuildPoint(head);
+  b.createNoResultOp(spv::Op::OpNop);
+  if (cf_blocks_.size() > cf_index + 1) {
+    b.createBranch(cf_blocks_[cf_index + 1].block);
+  } else {
+    b.makeReturn(false);
+  }
 }
 
 void SpirvShaderTranslator::ProcessExecInstructionBegin(
@@ -635,6 +763,7 @@ void SpirvShaderTranslator::ProcessExecInstructionBegin(
   switch (instr.type) {
     case ParsedExecInstruction::Type::kUnconditional: {
       // No need to do anything.
+      exec_cond_ = false;
     } break;
     case ParsedExecInstruction::Type::kConditional: {
       // Based off of bool_consts
@@ -665,27 +794,34 @@ void SpirvShaderTranslator::ProcessExecInstructionBegin(
       // Conditional branch
       assert_true(cf_blocks_.size() > instr.dword_index + 1);
       body = &b.makeNewBlock();
+      exec_cond_ = true;
+      exec_skip_block_ = &b.makeNewBlock();
 
-      auto next_block = cf_blocks_[instr.dword_index + 1];
-      if (next_block.prev_dominates) {
-        b.createSelectionMerge(next_block.block, spv::SelectionControlMaskNone);
-      }
-      b.createConditionalBranch(cond, body, next_block.block);
+      b.createSelectionMerge(
+          exec_skip_block_,
+          spv::SelectionControlMask::SelectionControlMaskNone);
+      b.createConditionalBranch(cond, body, exec_skip_block_);
+
+      b.setBuildPoint(exec_skip_block_);
+      b.createBranch(cf_blocks_[instr.dword_index + 1].block);
     } break;
     case ParsedExecInstruction::Type::kPredicated: {
       // Branch based on p0.
       assert_true(cf_blocks_.size() > instr.dword_index + 1);
       body = &b.makeNewBlock();
+      exec_cond_ = true;
+      exec_skip_block_ = &b.makeNewBlock();
+
       auto cond =
           b.createBinOp(spv::Op::OpLogicalEqual, bool_type_, b.createLoad(p0_),
                         b.makeBoolConstant(instr.condition));
+      b.createSelectionMerge(
+          exec_skip_block_,
+          spv::SelectionControlMask::SelectionControlMaskNone);
+      b.createConditionalBranch(cond, body, exec_skip_block_);
 
-      auto next_block = cf_blocks_[instr.dword_index + 1];
-      if (next_block.prev_dominates) {
-        b.createSelectionMerge(next_block.block, spv::SelectionControlMaskNone);
-      }
-      b.createConditionalBranch(cond, body, next_block.block);
-
+      b.setBuildPoint(exec_skip_block_);
+      b.createBranch(cf_blocks_[instr.dword_index + 1].block);
     } break;
   }
   b.setBuildPoint(body);
@@ -705,6 +841,8 @@ void SpirvShaderTranslator::ProcessExecInstructionEnd(
 
   if (instr.is_end) {
     b.makeReturn(false);
+  } else if (exec_cond_) {
+    b.createBranch(exec_skip_block_);
   } else {
     assert_true(cf_blocks_.size() > instr.dword_index + 1);
     b.createBranch(cf_blocks_[instr.dword_index + 1].block);
@@ -779,7 +917,8 @@ void SpirvShaderTranslator::ProcessJumpInstruction(
   b.setBuildPoint(head);
   switch (instr.type) {
     case ParsedJumpInstruction::Type::kUnconditional: {
-      b.createBranch(cf_blocks_[instr.target_address].block);
+      b.createStore(b.makeIntConstant(instr.target_address), pc_);
+      b.createBranch(switch_break_block_);
     } break;
     case ParsedJumpInstruction::Type::kConditional: {
       assert_true(cf_blocks_.size() > instr.dword_index + 1);
@@ -810,8 +949,11 @@ void SpirvShaderTranslator::ProcessJumpInstruction(
           instr.condition ? spv::Op::OpINotEqual : spv::Op::OpIEqual,
           bool_type_, v, b.makeUintConstant(0));
 
-      b.createConditionalBranch(cond, cf_blocks_[instr.target_address].block,
-                                cf_blocks_[instr.dword_index + 1].block);
+      auto next_pc = b.createTriOp(spv::Op::OpSelect, int_type_, cond,
+                                   b.makeIntConstant(instr.target_address),
+                                   b.makeIntConstant(instr.dword_index + 1));
+      b.createStore(next_pc, pc_);
+      b.createBranch(switch_break_block_);
     } break;
     case ParsedJumpInstruction::Type::kPredicated: {
       assert_true(cf_blocks_.size() > instr.dword_index + 1);
@@ -819,8 +961,12 @@ void SpirvShaderTranslator::ProcessJumpInstruction(
       auto cond =
           b.createBinOp(spv::Op::OpLogicalEqual, bool_type_, b.createLoad(p0_),
                         b.makeBoolConstant(instr.condition));
-      b.createConditionalBranch(cond, cf_blocks_[instr.target_address].block,
-                                cf_blocks_[instr.dword_index + 1].block);
+
+      auto next_pc = b.createTriOp(spv::Op::OpSelect, int_type_, cond,
+                                   b.makeIntConstant(instr.target_address),
+                                   b.makeIntConstant(instr.dword_index + 1));
+      b.createStore(next_pc, pc_);
+      b.createBranch(switch_break_block_);
     } break;
   }
 }
@@ -852,6 +998,45 @@ void SpirvShaderTranslator::ProcessAllocInstruction(
 
   assert_true(cf_blocks_.size() > instr.dword_index + 1);
   b.createBranch(cf_blocks_[instr.dword_index + 1].block);
+}
+
+spv::Id SpirvShaderTranslator::BitfieldExtract(spv::Id result_type,
+                                               spv::Id base, bool is_signed,
+                                               uint32_t offset,
+                                               uint32_t count) {
+  auto& b = *builder_;
+
+  spv::Id base_type = b.getTypeId(base);
+
+  // <-- 32 - (offset + count) ------ [bits] -?-
+  if (32 - (offset + count) > 0) {
+    base = b.createBinOp(spv::Op::OpShiftLeftLogical, base_type, base,
+                         b.makeUintConstant(32 - (offset + count)));
+  }
+  // [bits] -?-?-?---------------------------
+  auto op = is_signed ? spv::Op::OpShiftRightArithmetic
+                      : spv::Op::OpShiftRightLogical;
+  base = b.createBinOp(op, base_type, base, b.makeUintConstant(32 - count));
+
+  return base;
+}
+
+spv::Id SpirvShaderTranslator::ConvertNormVar(spv::Id var, spv::Id result_type,
+                                              uint32_t bits, bool is_signed) {
+  auto& b = *builder_;
+  if (is_signed) {
+    auto c = b.createBinOp(spv::Op::OpFOrdEqual, bool_type_, var,
+                           b.makeFloatConstant(-float(1 << (bits - 1))));
+    auto v = b.createBinOp(spv::Op::OpFDiv, result_type, var,
+                           b.makeFloatConstant(float((1 << (bits - 1)) - 1)));
+    var = b.createTriOp(spv::Op::OpSelect, result_type, c,
+                        b.makeFloatConstant(-1.f), v);
+  } else {
+    var = b.createBinOp(spv::Op::OpFDiv, result_type, var,
+                        b.makeFloatConstant(float((1 << bits) - 1)));
+  }
+
+  return var;
 }
 
 void SpirvShaderTranslator::ProcessVertexFetchInstruction(
@@ -894,6 +1079,9 @@ void SpirvShaderTranslator::ProcessVertexFetchInstruction(
   vertex_idx = b.createUnaryOp(spv::Op::OpConvertFToS, int_type_, vertex_idx);
   auto shader_vertex_idx = b.createLoad(vertex_idx_);
 
+  auto vertex_components =
+      GetVertexFormatComponentCount(instr.attributes.data_format);
+
   // Skip loading if it's an indexed fetch.
   auto vertex_ptr = vertex_binding_map_[instr.operands[1].storage_index]
                                        [instr.attributes.offset];
@@ -902,7 +1090,6 @@ void SpirvShaderTranslator::ProcessVertexFetchInstruction(
 
   auto cond = b.createBinOp(spv::Op::OpIEqual, bool_type_, vertex_idx,
                             shader_vertex_idx);
-  auto vertex_components = b.getNumComponents(vertex);
   Id alt_vertex = 0;
   switch (vertex_components) {
     case 1:
@@ -949,12 +1136,104 @@ void SpirvShaderTranslator::ProcessVertexFetchInstruction(
       break;
 
     case VertexFormat::k_10_11_11: {
-      // No conversion needed. Natively supported.
+      // This needs to be converted.
+      bool is_signed = instr.attributes.is_signed;
+      auto op =
+          is_signed ? spv::Op::OpBitFieldSExtract : spv::Op::OpBitFieldUExtract;
+      auto comp_type = is_signed ? int_type_ : uint_type_;
+
+      assert_true(comp_type == b.getTypeId(vertex));
+
+      spv::Id components[3] = {0};
+      /*
+      components[2] = b.createTriOp(
+          op, comp_type, vertex, b.makeUintConstant(0), b.makeUintConstant(10));
+      components[1] =
+          b.createTriOp(op, comp_type, vertex, b.makeUintConstant(10),
+                        b.makeUintConstant(11));
+      components[0] =
+          b.createTriOp(op, comp_type, vertex, b.makeUintConstant(21),
+                        b.makeUintConstant(11));
+      */
+      // Workaround until NVIDIA fixes their compiler :|
+      components[0] = BitfieldExtract(comp_type, vertex, is_signed, 00, 11);
+      components[1] = BitfieldExtract(comp_type, vertex, is_signed, 11, 11);
+      components[2] = BitfieldExtract(comp_type, vertex, is_signed, 22, 10);
+
+      op = is_signed ? spv::Op::OpConvertSToF : spv::Op::OpConvertUToF;
+      for (int i = 0; i < 3; i++) {
+        components[i] = b.createUnaryOp(op, float_type_, components[i]);
+      }
+
+      components[0] = ConvertNormVar(components[0], float_type_, 11, is_signed);
+      components[1] = ConvertNormVar(components[1], float_type_, 11, is_signed);
+      components[2] = ConvertNormVar(components[2], float_type_, 10, is_signed);
+
+      vertex = b.createCompositeConstruct(
+          vec3_float_type_,
+          std::vector<Id>({components[0], components[1], components[2]}));
     } break;
 
     case VertexFormat::k_11_11_10: {
       // This needs to be converted.
+      bool is_signed = instr.attributes.is_signed;
+      auto op =
+          is_signed ? spv::Op::OpBitFieldSExtract : spv::Op::OpBitFieldUExtract;
+      auto comp_type = is_signed ? int_type_ : uint_type_;
+
+      spv::Id components[3] = {0};
+      /*
+      components[2] = b.createTriOp(
+          op, comp_type, vertex, b.makeUintConstant(0), b.makeUintConstant(11));
+      components[1] =
+          b.createTriOp(op, comp_type, vertex, b.makeUintConstant(11),
+                        b.makeUintConstant(11));
+      components[0] =
+          b.createTriOp(op, comp_type, vertex, b.makeUintConstant(22),
+                        b.makeUintConstant(10));
+      */
+      // Workaround until NVIDIA fixes their compiler :|
+      components[0] = BitfieldExtract(comp_type, vertex, is_signed, 00, 10);
+      components[1] = BitfieldExtract(comp_type, vertex, is_signed, 10, 11);
+      components[2] = BitfieldExtract(comp_type, vertex, is_signed, 21, 11);
+
+      op = is_signed ? spv::Op::OpConvertSToF : spv::Op::OpConvertUToF;
+      for (int i = 0; i < 3; i++) {
+        components[i] = b.createUnaryOp(op, float_type_, components[i]);
+      }
+
+      components[0] = ConvertNormVar(components[0], float_type_, 11, is_signed);
+      components[1] = ConvertNormVar(components[1], float_type_, 11, is_signed);
+      components[2] = ConvertNormVar(components[2], float_type_, 10, is_signed);
+
+      vertex = b.createCompositeConstruct(
+          vec3_float_type_,
+          std::vector<Id>({components[0], components[1], components[2]}));
     } break;
+  }
+
+  // Convert any integers to floats.
+  auto scalar_type = b.getScalarTypeId(b.getTypeId(vertex));
+  if (scalar_type == int_type_ || scalar_type == uint_type_) {
+    auto op = scalar_type == int_type_ ? spv::Op::OpConvertSToF
+                                       : spv::Op::OpConvertUToF;
+    spv::Id vtx_type;
+    switch (vertex_components) {
+      case 1:
+        vtx_type = float_type_;
+        break;
+      case 2:
+        vtx_type = vec2_float_type_;
+        break;
+      case 3:
+        vtx_type = vec3_float_type_;
+        break;
+      case 4:
+        vtx_type = vec4_float_type_;
+        break;
+    }
+
+    vertex = b.createUnaryOp(op, vtx_type, vertex);
   }
 
   vertex = b.createTriOp(spv::Op::OpSelect, b.getTypeId(vertex), cond, vertex,
@@ -1000,23 +1279,18 @@ void SpirvShaderTranslator::ProcessTextureFetchInstruction(
   assert_not_zero(src);
 
   uint32_t dim_idx = 0;
-  spv::Id image_type = 0;
   switch (instr.dimension) {
     case TextureDimension::k1D: {
       dim_idx = 0;
-      image_type = image_1d_type_;
     } break;
     case TextureDimension::k2D: {
       dim_idx = 1;
-      image_type = image_2d_type_;
     } break;
     case TextureDimension::k3D: {
       dim_idx = 2;
-      image_type = image_3d_type_;
     } break;
     case TextureDimension::kCube: {
       dim_idx = 3;
-      image_type = image_cube_type_;
     } break;
     default:
       assert_unhandled_case(instr.dimension);
@@ -1030,9 +1304,23 @@ void SpirvShaderTranslator::ProcessTextureFetchInstruction(
                               tex_[dim_idx], std::vector<Id>({texture_index}));
       auto texture = b.createLoad(texture_ptr);
 
+      spv::Id size = 0;
+      if (instr.attributes.offset_x || instr.attributes.offset_y) {
+        auto image =
+            b.createUnaryOp(spv::OpImage, b.getImageType(texture), texture);
+
+        spv::Builder::TextureParameters params;
+        std::memset(&params, 0, sizeof(params));
+        params.sampler = image;
+        params.lod = b.makeIntConstant(0);
+        size = b.createTextureQueryCall(spv::Op::OpImageQuerySizeLod, params);
+      }
+
       if (instr.dimension == TextureDimension::k1D &&
           (instr.attributes.offset_x)) {
         auto offset = b.makeFloatConstant(instr.attributes.offset_x + 0.5f);
+        offset = b.createBinOp(spv::Op::OpFDiv, float_type_, offset, size);
+
         src = b.createBinOp(spv::Op::OpFAdd, float_type_, src, offset);
       } else if (instr.dimension == TextureDimension::k2D &&
                  (instr.attributes.offset_x || instr.attributes.offset_y)) {
@@ -1041,6 +1329,8 @@ void SpirvShaderTranslator::ProcessTextureFetchInstruction(
             std::vector<Id>(
                 {b.makeFloatConstant(instr.attributes.offset_x + 0.5f),
                  b.makeFloatConstant(instr.attributes.offset_y + 0.5f)}));
+
+        offset = b.createBinOp(spv::Op::OpFDiv, vec2_float_type_, offset, size);
         src = b.createBinOp(spv::Op::OpFAdd, vec2_float_type_, src, offset);
       }
 
@@ -1056,19 +1346,21 @@ void SpirvShaderTranslator::ProcessTextureFetchInstruction(
       auto texture_ptr =
           b.createAccessChain(spv::StorageClass::StorageClassUniformConstant,
                               tex_[dim_idx], std::vector<Id>({texture_index}));
-      auto image = b.createUnaryOp(spv::Op::OpImage, image_type,
-                                   b.createLoad(texture_ptr));
+      auto texture = b.createLoad(texture_ptr);
+      auto image =
+          b.createUnaryOp(spv::OpImage, b.getImageType(texture), texture);
 
-      /*
       switch (instr.dimension) {
         case TextureDimension::k1D: {
+          spv::Builder::TextureParameters params;
+          std::memset(&params, 0, sizeof(params));
+          params.sampler = image;
+          params.lod = b.makeIntConstant(0);
           auto size =
-              b.createUnaryOp(spv::Op::OpImageQuerySize, uint_type_, image);
+              b.createTextureQueryCall(spv::Op::OpImageQuerySizeLod, params);
           size = b.createUnaryOp(spv::Op::OpConvertUToF, float_type_, size);
-          auto tex_coord = b.createCompositeExtract(src, float_type_, 0);
 
-          auto weight =
-              b.createBinOp(spv::Op::OpFMul, float_type_, size, tex_coord);
+          auto weight = b.createBinOp(spv::Op::OpFMul, float_type_, size, src);
           weight = CreateGlslStd450InstructionCall(
               spv::NoPrecision, float_type_, spv::GLSLstd450::kFract, {weight});
 
@@ -1077,15 +1369,17 @@ void SpirvShaderTranslator::ProcessTextureFetchInstruction(
         } break;
 
         case TextureDimension::k2D: {
-          auto size = b.createUnaryOp(spv::Op::OpImageQuerySize,
-                                      vec2_uint_type_, image);
+          spv::Builder::TextureParameters params;
+          std::memset(&params, 0, sizeof(params));
+          params.sampler = image;
+          params.lod = b.makeIntConstant(0);
+          auto size =
+              b.createTextureQueryCall(spv::Op::OpImageQuerySizeLod, params);
           size =
               b.createUnaryOp(spv::Op::OpConvertUToF, vec2_float_type_, size);
-          auto tex_coord = b.createOp(spv::Op::OpVectorShuffle,
-                                      vec2_float_type_, {src, src, 0, 1});
 
           auto weight =
-              b.createBinOp(spv::Op::OpFMul, vec2_float_type_, size, tex_coord);
+              b.createBinOp(spv::Op::OpFMul, vec2_float_type_, size, src);
           weight = CreateGlslStd450InstructionCall(
               spv::NoPrecision, vec2_float_type_, spv::GLSLstd450::kFract,
               {weight});
@@ -1096,15 +1390,14 @@ void SpirvShaderTranslator::ProcessTextureFetchInstruction(
 
         default:
           // TODO(DrChat): The rest of these.
-          assert_always();
+          assert_unhandled_case(instr.dimension);
           break;
       }
-      */
     } break;
 
     default:
       // TODO: the rest of these
-      assert_always();
+      assert_unhandled_case(instr.opcode);
       break;
   }
 
@@ -2430,7 +2723,11 @@ void SpirvShaderTranslator::StoreToResult(Id source_value_id,
       break;
     case InstructionStorageTarget::kPointSize:
       assert_true(is_vertex_shader());
-      // TODO(benvanik): result.storage_index
+      storage_pointer = point_size_;
+      storage_class = spv::StorageClass::StorageClassOutput;
+      storage_type = float_type_;
+      storage_offsets.push_back(0);
+      storage_array = false;
       break;
     case InstructionStorageTarget::kColorTarget:
       assert_true(is_pixel_shader());

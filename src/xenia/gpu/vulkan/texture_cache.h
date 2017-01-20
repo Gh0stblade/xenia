@@ -52,7 +52,7 @@ class TextureCache {
     bool pending_invalidation;
 
     // Pointer to the latest usage fence.
-    std::shared_ptr<ui::vulkan::Fence> in_flight_fence;
+    VkFence in_flight_fence;
   };
 
   struct TextureView {
@@ -88,8 +88,7 @@ class TextureCache {
   // Requires a fence to be provided that will be signaled when finished
   // using the returned descriptor set.
   VkDescriptorSet PrepareTextureSet(
-      VkCommandBuffer setup_command_buffer,
-      std::shared_ptr<ui::vulkan::Fence> completion_fence,
+      VkCommandBuffer setup_command_buffer, VkFence completion_fence,
       const std::vector<Shader::TextureBinding>& vertex_bindings,
       const std::vector<Shader::TextureBinding>& pixel_bindings);
 
@@ -140,30 +139,38 @@ class TextureCache {
 
   // Demands a texture. If command_buffer is null and the texture hasn't been
   // uploaded to graphics memory already, we will return null and bail.
-  Texture* Demand(
-      const TextureInfo& texture_info, VkCommandBuffer command_buffer = nullptr,
-      std::shared_ptr<ui::vulkan::Fence> completion_fence = nullptr);
+  Texture* Demand(const TextureInfo& texture_info,
+                  VkCommandBuffer command_buffer = nullptr,
+                  VkFence completion_fence = nullptr);
   TextureView* DemandView(Texture* texture, uint16_t swizzle);
   Sampler* Demand(const SamplerInfo& sampler_info);
+
+  void FlushPendingCommands(VkCommandBuffer command_buffer,
+                            VkFence completion_fence);
+
+  void ConvertTexture1D(uint8_t* dest, const TextureInfo& src);
+  void ConvertTexture2D(uint8_t* dest, const TextureInfo& src);
+  void ConvertTextureCube(uint8_t* dest, const TextureInfo& src);
 
   // Queues commands to upload a texture from system memory, applying any
   // conversions necessary. This may flush the command buffer to the GPU if we
   // run out of staging memory.
-  bool UploadTexture2D(VkCommandBuffer command_buffer,
-                       std::shared_ptr<ui::vulkan::Fence> completion_fence,
-                       Texture* dest, TextureInfo src);
+  bool UploadTexture1D(VkCommandBuffer command_buffer, VkFence completion_fence,
+                       Texture* dest, const TextureInfo& src);
+
+  bool UploadTexture2D(VkCommandBuffer command_buffer, VkFence completion_fence,
+                       Texture* dest, const TextureInfo& src);
 
   bool UploadTextureCube(VkCommandBuffer command_buffer,
-                         std::shared_ptr<ui::vulkan::Fence> completion_fence,
-                         Texture* dest, TextureInfo src);
+                         VkFence completion_fence, Texture* dest,
+                         const TextureInfo& src);
 
   bool SetupTextureBindings(
-      VkCommandBuffer command_buffer,
-      std::shared_ptr<ui::vulkan::Fence> completion_fence,
+      VkCommandBuffer command_buffer, VkFence completion_fence,
       UpdateSetInfo* update_set_info,
       const std::vector<Shader::TextureBinding>& bindings);
   bool SetupTextureBinding(VkCommandBuffer command_buffer,
-                           std::shared_ptr<ui::vulkan::Fence> completion_fence,
+                           VkFence completion_fence,
                            UpdateSetInfo* update_set_info,
                            const Shader::TextureBinding& binding);
 
@@ -172,11 +179,11 @@ class TextureCache {
   RegisterFile* register_file_ = nullptr;
   TraceWriter* trace_writer_ = nullptr;
   ui::vulkan::VulkanDevice* device_ = nullptr;
+  VkQueue device_queue_ = nullptr;
 
   VkDescriptorPool descriptor_pool_ = nullptr;
   VkDescriptorSetLayout texture_descriptor_set_layout_ = nullptr;
-  std::list<std::pair<VkDescriptorSet, std::shared_ptr<ui::vulkan::Fence>>>
-      in_flight_sets_;
+  std::list<std::pair<VkDescriptorSet, VkFence>> in_flight_sets_;
 
   ui::vulkan::CircularBuffer staging_buffer_;
   std::unordered_map<uint64_t, Texture*> textures_;

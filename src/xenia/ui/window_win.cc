@@ -101,9 +101,13 @@ bool Win32Window::OnCreate() {
 
   // Enable DWM elevation.
   EnableMMCSS();
+  // Enable file dragging from external sources
+  DragAcceptFiles(hwnd_, true);
 
   ShowWindow(hwnd_, SW_SHOWNORMAL);
   UpdateWindow(hwnd_);
+
+  arrow_cursor_ = LoadCursor(nullptr, IDC_ARROW);
 
   // Initial state.
   if (!is_cursor_visible_) {
@@ -254,9 +258,10 @@ void Win32Window::set_cursor_visible(bool value) {
   if (is_cursor_visible_ == value) {
     return;
   }
+  is_cursor_visible_ = value;
+
   if (value) {
     ShowCursor(TRUE);
-    SetCursor(nullptr);
   } else {
     ShowCursor(FALSE);
   }
@@ -375,6 +380,21 @@ LRESULT Win32Window::WndProc(HWND hWnd, UINT message, WPARAM wParam,
   }
 
   switch (message) {
+    case WM_DROPFILES: {
+      TCHAR lpszFile[MAX_PATH] = {0};
+      UINT uFiles = 0;
+      HDROP hDrop = (HDROP)wParam;
+      // Get number of files dropped
+      uFiles = DragQueryFile(hDrop, -1, NULL, NULL);
+
+      // Only getting first file dropped (other files ignored)
+      if (DragQueryFile(hDrop, 0, lpszFile, MAX_PATH)) {
+        auto e = FileDropEvent(this, lpszFile);
+        OnFileDrop(&e);
+      }
+
+      DragFinish(hDrop);
+    } break;
     case WM_NCCREATE:
       break;
     case WM_CREATE:
@@ -483,8 +503,8 @@ bool Win32Window::HandleMouse(UINT message, WPARAM wParam, LPARAM lParam) {
   }
 
   MouseEvent::Button button = MouseEvent::Button::kNone;
-  int32_t dx = 0;
-  int32_t dy = 0;
+  int32_t dx = x - last_mouse_pos_.x;
+  int32_t dy = y - last_mouse_pos_.y;
   switch (message) {
     case WM_LBUTTONDOWN:
     case WM_LBUTTONUP:
@@ -523,6 +543,8 @@ bool Win32Window::HandleMouse(UINT message, WPARAM wParam, LPARAM lParam) {
       // Double click/etc?
       return true;
   }
+
+  last_mouse_pos_ = {x, y};
 
   auto e = MouseEvent(this, button, x, y, dx, dy);
   switch (message) {

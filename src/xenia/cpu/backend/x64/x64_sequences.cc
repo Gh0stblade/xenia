@@ -610,6 +610,7 @@ struct Sequence {
         reg_reg_fn(e, i.src2, temp);
       }
     } else if (i.src2.is_constant) {
+      assert_true(!i.src1.is_constant);
       if (i.src2.ConstantFitsIn32Reg()) {
         reg_const_fn(e, i.src1, static_cast<int32_t>(i.src2.constant()));
       } else {
@@ -636,6 +637,7 @@ struct Sequence {
         reg_reg_fn(e, i.dest, i.src2, temp, true);
       }
     } else if (i.src2.is_constant) {
+      assert_true(!i.src1.is_constant);
       if (i.src2.ConstantFitsIn32Reg()) {
         reg_const_fn(e, i.dest, i.src1, static_cast<int32_t>(i.src2.constant()),
                      false);
@@ -1609,7 +1611,7 @@ struct LOAD_VECTOR_SHL_I8
       e.shl(e.dx, 4);
       e.mov(e.rax, (uintptr_t)lvsl_table);
       e.vmovaps(i.dest, e.ptr[e.rax + e.rdx]);
-      e.ReloadEDX();
+      e.ReloadMembase();
     }
   }
 };
@@ -1651,7 +1653,7 @@ struct LOAD_VECTOR_SHR_I8
       e.shl(e.dx, 4);
       e.mov(e.rax, (uintptr_t)lvsr_table);
       e.vmovaps(i.dest, e.ptr[e.rax + e.rdx]);
-      e.ReloadEDX();
+      e.ReloadMembase();
     }
   }
 };
@@ -1791,7 +1793,7 @@ EMITTER_OPCODE_TABLE(OPCODE_STORE_LOCAL, STORE_LOCAL_I8, STORE_LOCAL_I16,
 // ============================================================================
 // Note: all types are always aligned in the context.
 RegExp ComputeContextAddress(X64Emitter& e, const OffsetOp& offset) {
-  return e.rcx + offset.value;
+  return e.GetContextReg() + offset.value;
 }
 struct LOAD_CONTEXT_I8
     : Sequence<LOAD_CONTEXT_I8, I<OPCODE_LOAD_CONTEXT, I8Op, OffsetOp>> {
@@ -2086,12 +2088,12 @@ RegExp ComputeMemoryAddress(X64Emitter& e, const T& guest) {
     // Since the constant is often 0x8... if we tried to use that as a
     // displacement it would be sign extended and mess things up.
     e.mov(e.eax, static_cast<uint32_t>(guest.constant()));
-    return e.rdx + e.rax;
+    return e.GetMembaseReg() + e.rax;
   } else {
     // Clear the top 32 bits, as they are likely garbage.
     // TODO(benvanik): find a way to avoid doing this.
     e.mov(e.eax, guest.reg().cvt32());
-    return e.rdx + e.rax;
+    return e.GetMembaseReg() + e.rax;
   }
 }
 struct LOAD_I8 : Sequence<LOAD_I8, I<OPCODE_LOAD, I8Op, I64Op>> {
@@ -3786,7 +3788,7 @@ struct MUL_I8 : Sequence<MUL_I8, I<OPCODE_MUL, I8Op, I8Op, I8Op>> {
       }
     }
 
-    e.ReloadEDX();
+    e.ReloadMembase();
   }
 };
 struct MUL_I16 : Sequence<MUL_I16, I<OPCODE_MUL, I16Op, I16Op, I16Op>> {
@@ -3829,7 +3831,7 @@ struct MUL_I16 : Sequence<MUL_I16, I<OPCODE_MUL, I16Op, I16Op, I16Op>> {
       }
     }
 
-    e.ReloadEDX();
+    e.ReloadMembase();
   }
 };
 struct MUL_I32 : Sequence<MUL_I32, I<OPCODE_MUL, I32Op, I32Op, I32Op>> {
@@ -3873,7 +3875,7 @@ struct MUL_I32 : Sequence<MUL_I32, I<OPCODE_MUL, I32Op, I32Op, I32Op>> {
       }
     }
 
-    e.ReloadEDX();
+    e.ReloadMembase();
   }
 };
 struct MUL_I64 : Sequence<MUL_I64, I<OPCODE_MUL, I64Op, I64Op, I64Op>> {
@@ -3916,7 +3918,7 @@ struct MUL_I64 : Sequence<MUL_I64, I<OPCODE_MUL, I64Op, I64Op, I64Op>> {
       }
     }
 
-    e.ReloadEDX();
+    e.ReloadMembase();
   }
 };
 struct MUL_F32 : Sequence<MUL_F32, I<OPCODE_MUL, F32Op, F32Op, F32Op>> {
@@ -3957,7 +3959,6 @@ struct MUL_HI_I8 : Sequence<MUL_HI_I8, I<OPCODE_MUL_HI, I8Op, I8Op, I8Op>> {
     if (i.instr->flags & ARITHMETIC_UNSIGNED) {
       // mulx: $1:$2 = EDX * $3
 
-      // TODO(justin): Find a way to shorten this has call
       if (e.IsFeatureEnabled(kX64EmitBMI2)) {
         // TODO(benvanik): place src1 in eax? still need to sign extend
         e.movzx(e.edx, i.src1);
@@ -3995,14 +3996,13 @@ struct MUL_HI_I8 : Sequence<MUL_HI_I8, I<OPCODE_MUL_HI, I8Op, I8Op, I8Op>> {
       }
       e.mov(i.dest, e.ah);
     }
-    e.ReloadEDX();
+    e.ReloadMembase();
   }
 };
 struct MUL_HI_I16
     : Sequence<MUL_HI_I16, I<OPCODE_MUL_HI, I16Op, I16Op, I16Op>> {
   static void Emit(X64Emitter& e, const EmitArgType& i) {
     if (i.instr->flags & ARITHMETIC_UNSIGNED) {
-      // TODO(justin): Find a way to shorten this has call
       if (e.IsFeatureEnabled(kX64EmitBMI2)) {
         // TODO(benvanik): place src1 in eax? still need to sign extend
         e.movzx(e.edx, i.src1);
@@ -4040,14 +4040,13 @@ struct MUL_HI_I16
       }
       e.mov(i.dest, e.dx);
     }
-    e.ReloadEDX();
+    e.ReloadMembase();
   }
 };
 struct MUL_HI_I32
     : Sequence<MUL_HI_I32, I<OPCODE_MUL_HI, I32Op, I32Op, I32Op>> {
   static void Emit(X64Emitter& e, const EmitArgType& i) {
     if (i.instr->flags & ARITHMETIC_UNSIGNED) {
-      // TODO(justin): Find a way to shorten this has call
       if (e.IsFeatureEnabled(kX64EmitBMI2)) {
         // TODO(benvanik): place src1 in eax? still need to sign extend
         e.mov(e.edx, i.src1);
@@ -4090,14 +4089,13 @@ struct MUL_HI_I32
       }
       e.mov(i.dest, e.edx);
     }
-    e.ReloadEDX();
+    e.ReloadMembase();
   }
 };
 struct MUL_HI_I64
     : Sequence<MUL_HI_I64, I<OPCODE_MUL_HI, I64Op, I64Op, I64Op>> {
   static void Emit(X64Emitter& e, const EmitArgType& i) {
     if (i.instr->flags & ARITHMETIC_UNSIGNED) {
-      // TODO(justin): Find a way to shorten this has call
       if (e.IsFeatureEnabled(kX64EmitBMI2)) {
         // TODO(benvanik): place src1 in eax? still need to sign extend
         e.mov(e.rdx, i.src1);
@@ -4140,7 +4138,7 @@ struct MUL_HI_I64
       }
       e.mov(i.dest, e.rdx);
     }
-    e.ReloadEDX();
+    e.ReloadMembase();
   }
 };
 EMITTER_OPCODE_TABLE(OPCODE_MUL_HI, MUL_HI_I8, MUL_HI_I16, MUL_HI_I32,
@@ -4195,9 +4193,9 @@ struct DIV_I8 : Sequence<DIV_I8, I<OPCODE_DIV, I8Op, I8Op, I8Op>> {
     e.outLocalLabel();
     e.mov(i.dest, e.al);
     if (clobbered_rcx) {
-      e.ReloadECX();
+      e.ReloadContext();
     }
-    e.ReloadEDX();
+    e.ReloadMembase();
   }
 };
 struct DIV_I16 : Sequence<DIV_I16, I<OPCODE_DIV, I16Op, I16Op, I16Op>> {
@@ -4250,9 +4248,9 @@ struct DIV_I16 : Sequence<DIV_I16, I<OPCODE_DIV, I16Op, I16Op, I16Op>> {
     e.outLocalLabel();
     e.mov(i.dest, e.ax);
     if (clobbered_rcx) {
-      e.ReloadECX();
+      e.ReloadContext();
     }
-    e.ReloadEDX();
+    e.ReloadMembase();
   }
 };
 struct DIV_I32 : Sequence<DIV_I32, I<OPCODE_DIV, I32Op, I32Op, I32Op>> {
@@ -4305,9 +4303,9 @@ struct DIV_I32 : Sequence<DIV_I32, I<OPCODE_DIV, I32Op, I32Op, I32Op>> {
     e.outLocalLabel();
     e.mov(i.dest, e.eax);
     if (clobbered_rcx) {
-      e.ReloadECX();
+      e.ReloadContext();
     }
-    e.ReloadEDX();
+    e.ReloadMembase();
   }
 };
 struct DIV_I64 : Sequence<DIV_I64, I<OPCODE_DIV, I64Op, I64Op, I64Op>> {
@@ -4360,9 +4358,9 @@ struct DIV_I64 : Sequence<DIV_I64, I<OPCODE_DIV, I64Op, I64Op, I64Op>> {
     e.outLocalLabel();
     e.mov(i.dest, e.rax);
     if (clobbered_rcx) {
-      e.ReloadECX();
+      e.ReloadContext();
     }
-    e.ReloadEDX();
+    e.ReloadMembase();
   }
 };
 struct DIV_F32 : Sequence<DIV_F32, I<OPCODE_DIV, F32Op, F32Op, F32Op>> {
@@ -5227,7 +5225,7 @@ void EmitShlXX(X64Emitter& e, const ARGS& i) {
         } else {
           e.mov(e.cl, src);
           e.shl(dest_src, e.cl);
-          e.ReloadECX();
+          e.ReloadContext();
         }
       },
       [](X64Emitter& e, const REG& dest_src, int8_t constant) {
@@ -5305,7 +5303,7 @@ void EmitShrXX(X64Emitter& e, const ARGS& i) {
         } else {
           e.mov(e.cl, src);
           e.shr(dest_src, e.cl);
-          e.ReloadECX();
+          e.ReloadContext();
         }
       },
       [](X64Emitter& e, const REG& dest_src, int8_t constant) {
@@ -5381,7 +5379,7 @@ void EmitSarXX(X64Emitter& e, const ARGS& i) {
         } else {
           e.mov(e.cl, src);
           e.sar(dest_src, e.cl);
-          e.ReloadECX();
+          e.ReloadContext();
         }
       },
       [](X64Emitter& e, const REG& dest_src, int8_t constant) {
@@ -5990,7 +5988,7 @@ void EmitRotateLeftXX(X64Emitter& e, const ARGS& i) {
       }
     }
     e.rol(i.dest, e.cl);
-    e.ReloadECX();
+    e.ReloadContext();
   }
 }
 struct ROTATE_LEFT_I8
@@ -6264,11 +6262,8 @@ struct CNTLZ_I8 : Sequence<CNTLZ_I8, I<OPCODE_CNTLZ, I8Op, I8Op>> {
       e.bsr(i.dest, i.src1);
       e.jz(jz);  // Jump if zero
 
-      // sub: $1 = $1 - $2
       // Invert the result (7 - i.dest)
-      e.mov(e.eax, 7);
-      e.sub(e.eax, i.dest);
-      e.mov(i.dest, e.eax);
+      e.xor_(i.dest, 0x7);
       e.jmp(jend);  // Jmp to end
 
       // src1 was zero, so write 8 to the dest reg
@@ -6295,11 +6290,8 @@ struct CNTLZ_I16 : Sequence<CNTLZ_I16, I<OPCODE_CNTLZ, I8Op, I16Op>> {
       e.bsr(i.dest, i.src1);
       e.jz(jz);  // Jump if zero
 
-      // sub: $1 = $1 - $2
       // Invert the result (15 - i.dest)
-      e.mov(e.eax, 15);
-      e.sub(e.eax, i.dest);
-      e.mov(i.dest, e.eax);
+      e.xor_(i.dest, 0xF);
       e.jmp(jend);  // Jmp to end
 
       // src1 was zero, so write 16 to the dest reg
@@ -6325,11 +6317,8 @@ struct CNTLZ_I32 : Sequence<CNTLZ_I32, I<OPCODE_CNTLZ, I8Op, I32Op>> {
       e.bsr(i.dest, i.src1);
       e.jz(jz);  // Jump if zero
 
-      // sub: $1 = $1 - $2
       // Invert the result (31 - i.dest)
-      e.mov(e.eax, 31);
-      e.sub(e.eax, i.dest);
-      e.mov(i.dest, e.eax);
+      e.xor_(i.dest, 0x1F);
       e.jmp(jend);  // Jmp to end
 
       // src1 was zero, so write 32 to the dest reg
@@ -6355,11 +6344,8 @@ struct CNTLZ_I64 : Sequence<CNTLZ_I64, I<OPCODE_CNTLZ, I8Op, I64Op>> {
       e.bsr(i.dest, i.src1);
       e.jz(jz);  // Jump if zero
 
-      // sub: $1 = $1 - $2
       // Invert the result (63 - i.dest)
-      e.mov(e.rax, 63);
-      e.sub(e.rax, i.dest);
-      e.mov(i.dest, e.rax);
+      e.xor_(i.dest, 0x3F);
       e.jmp(jend);  // Jmp to end
 
       // src1 was zero, so write 64 to the dest reg
@@ -6475,15 +6461,23 @@ struct EXTRACT_I32
       // e.vpshufb(e.xmm0, i.src1, e.xmm0);
       // e.vmovd(i.dest.reg().cvt32(), e.xmm0);
       // Get the desired word in xmm0, then extract that.
+      Xmm src1;
+      if (i.src1.is_constant) {
+        src1 = e.xmm1;
+        e.LoadConstantXmm(src1, i.src1.constant());
+      } else {
+        src1 = i.src1.reg();
+      }
+
       e.xor_(e.rax, e.rax);
       e.mov(e.al, i.src2);
       e.and_(e.al, 0x03);
       e.shl(e.al, 4);
       e.mov(e.rdx, reinterpret_cast<uint64_t>(extract_table_32));
       e.vmovaps(e.xmm0, e.ptr[e.rdx + e.rax]);
-      e.vpshufb(e.xmm0, i.src1, e.xmm0);
+      e.vpshufb(e.xmm0, src1, e.xmm0);
       e.vpextrd(i.dest, e.xmm0, 0);
-      e.ReloadEDX();
+      e.ReloadMembase();
     }
   }
 };
@@ -7522,10 +7516,10 @@ struct ATOMIC_COMPARE_EXCHANGE_I32
     e.mov(e.eax, i.src2);
     e.mov(e.ecx, i.src1.reg().cvt32());
     e.lock();
-    e.cmpxchg(e.dword[e.rdx + e.rcx], i.src3);
+    e.cmpxchg(e.dword[e.GetMembaseReg() + e.rcx], i.src3);
     e.sete(i.dest);
 
-    e.ReloadECX();
+    e.ReloadContext();
   }
 };
 struct ATOMIC_COMPARE_EXCHANGE_I64
@@ -7535,10 +7529,10 @@ struct ATOMIC_COMPARE_EXCHANGE_I64
     e.mov(e.rax, i.src2);
     e.mov(e.ecx, i.src1.reg().cvt32());
     e.lock();
-    e.cmpxchg(e.qword[e.rdx + e.rcx], i.src3);
+    e.cmpxchg(e.qword[e.GetMembaseReg() + e.rcx], i.src3);
     e.sete(i.dest);
 
-    e.ReloadECX();
+    e.ReloadContext();
   }
 };
 EMITTER_OPCODE_TABLE(OPCODE_ATOMIC_COMPARE_EXCHANGE,

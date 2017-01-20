@@ -304,6 +304,7 @@ using qword_t = const shim::ParamBase<uint64_t>&;
 using float_t = const shim::ParamBase<float>&;
 using double_t = const shim::ParamBase<double>&;
 using lpvoid_t = const shim::PointerParam&;
+using lpword_t = const shim::PrimitivePointerParam<uint16_t>&;
 using lpdword_t = const shim::PrimitivePointerParam<uint32_t>&;
 using lpqword_t = const shim::PrimitivePointerParam<uint64_t>&;
 using lpfloat_t = const shim::PrimitivePointerParam<float>&;
@@ -316,6 +317,7 @@ using lpunknown_t = const shim::PointerParam&;
 template <typename T>
 using pointer_t = const shim::TypedPointerParam<T>&;
 
+using int_result_t = shim::Result<int32_t>;
 using dword_result_t = shim::Result<uint32_t>;
 using pointer_result_t = shim::Result<uint32_t>;
 
@@ -370,6 +372,18 @@ inline void AppendParam(StringBuffer* string_buffer, lpdouble_t param) {
     string_buffer->AppendFormat("(%G)", param.value());
   }
 }
+inline void AppendParam(StringBuffer* string_buffer, lpstring_t param) {
+  string_buffer->AppendFormat("%.8X", param.guest_address());
+  if (param) {
+    string_buffer->AppendFormat("(%s)", param.value().c_str());
+  }
+}
+inline void AppendParam(StringBuffer* string_buffer, lpwstring_t param) {
+  string_buffer->AppendFormat("%.8X", param.guest_address());
+  if (param) {
+    string_buffer->AppendFormat("(%S)", param.value().c_str());
+  }
+}
 inline void AppendParam(StringBuffer* string_buffer,
                         pointer_t<X_OBJECT_ATTRIBUTES> record) {
   string_buffer->AppendFormat("%.8X", record.guest_address());
@@ -404,6 +418,7 @@ void AppendParam(StringBuffer* string_buffer, pointer_t<T> param) {
 enum class KernelModuleId {
   xboxkrnl,
   xam,
+  xbdm,
 };
 
 template <size_t I = 0, typename... Ps>
@@ -517,6 +532,7 @@ using xe::cpu::ExportTag;
           &name, #name, tags));
 
 #define DECLARE_XAM_EXPORT(name, tags) DECLARE_EXPORT(xam, name, tags)
+#define DECLARE_XBDM_EXPORT(name, tags) DECLARE_EXPORT(xbdm, name, tags)
 #define DECLARE_XBOXKRNL_EXPORT(name, tags) DECLARE_EXPORT(xboxkrnl, name, tags)
 
 }  // namespace kernel

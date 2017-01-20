@@ -32,6 +32,7 @@ using xe::ui::KeyEvent;
 using xe::ui::MenuItem;
 using xe::ui::MouseEvent;
 using xe::ui::UIEvent;
+using xe::ui::FileDropEvent;
 
 const std::wstring kBaseTitle = L"xenia";
 
@@ -80,6 +81,9 @@ bool EmulatorWindow::Initialize() {
     exit(1);
   });
   loop_->on_quit.AddListener([this](UIEvent* e) { window_.reset(); });
+
+  window_->on_file_drop.AddListener(
+      [this](FileDropEvent* e) { FileDrop(e->filename()); });
 
   window_->on_key_down.AddListener([this](KeyEvent* e) {
     bool handled = true;
@@ -141,6 +145,20 @@ bool EmulatorWindow::Initialize() {
     e->set_handled(handled);
   });
 
+  window_->on_mouse_move.AddListener([this](MouseEvent* e) {
+    if (window_->is_fullscreen() && (e->dx() > 2 || e->dy() > 2)) {
+      if (!window_->is_cursor_visible()) {
+        window_->set_cursor_visible(true);
+      }
+
+      cursor_hide_time_ = Clock::QueryHostSystemTime() + 30000000;
+    }
+
+    e->set_handled(false);
+  });
+
+  window_->on_paint.AddListener([this](UIEvent* e) { CheckHideCursor(); });
+
   // Main menu.
   // FIXME: This code is really messy.
   auto main_menu = MenuItem::Create(MenuItem::Type::kNormal);
@@ -149,6 +167,9 @@ bool EmulatorWindow::Initialize() {
     file_menu->AddChild(
         MenuItem::Create(MenuItem::Type::kString, L"&Open", L"Ctrl+O",
                          std::bind(&EmulatorWindow::FileOpen, this)));
+    file_menu->AddChild(
+        MenuItem::Create(MenuItem::Type::kString, L"Close",
+                         std::bind(&EmulatorWindow::FileClose, this)));
     file_menu->AddChild(MenuItem::Create(MenuItem::Type::kString, L"E&xit",
                                          L"Alt+F4",
                                          [this]() { window_->Close(); }));
@@ -243,6 +264,15 @@ bool EmulatorWindow::Initialize() {
   return true;
 }
 
+void EmulatorWindow::FileDrop(wchar_t* filename) {
+  std::wstring path = filename;
+  auto result = emulator_->LaunchPath(path);
+  if (XFAILED(result)) {
+    // TODO: Display a message box.
+    XELOGE("Failed to launch target: %.8X", result);
+  }
+}
+
 void EmulatorWindow::FileOpen() {
   std::wstring path;
 
@@ -274,6 +304,23 @@ void EmulatorWindow::FileOpen() {
       // TODO: Display a message box.
       XELOGE("Failed to launch target: %.8X", result);
     }
+  }
+}
+
+void EmulatorWindow::FileClose() {
+  if (emulator_->is_title_open()) {
+    emulator_->TerminateTitle();
+  }
+}
+
+void EmulatorWindow::CheckHideCursor() {
+  if (!window_->is_fullscreen()) {
+    // Only hide when fullscreen.
+    return;
+  }
+
+  if (Clock::QueryHostSystemTime() > cursor_hide_time_) {
+    window_->set_cursor_visible(false);
   }
 }
 
@@ -320,6 +367,12 @@ void EmulatorWindow::GpuClearCaches() {
 
 void EmulatorWindow::ToggleFullscreen() {
   window_->ToggleFullscreen(!window_->is_fullscreen());
+
+  // Hide the cursor after a second if we're going fullscreen
+  cursor_hide_time_ = Clock::QueryHostSystemTime() + 30000000;
+  if (!window_->is_fullscreen()) {
+    window_->set_cursor_visible(true);
+  }
 }
 
 void EmulatorWindow::ShowHelpWebsite() { LaunchBrowser("http://xenia.jp"); }
