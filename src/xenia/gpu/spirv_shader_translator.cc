@@ -11,6 +11,7 @@
 
 #include <gflags/gflags.h>
 
+#include <cfloat>
 #include <cstring>
 
 #include "xenia/base/logging.h"
@@ -116,6 +117,14 @@ void SpirvShaderTranslator::StartTranslation() {
   Id loop_consts_type = b.makeArrayType(uint_type_, b.makeUintConstant(32), 1);
   Id bool_consts_type = b.makeArrayType(uint_type_, b.makeUintConstant(8), 1);
 
+  // Strides
+  b.addDecoration(float_consts_type, spv::Decoration::DecorationArrayStride,
+                  4 * sizeof(float));
+  b.addDecoration(loop_consts_type, spv::Decoration::DecorationArrayStride,
+                  sizeof(uint32_t));
+  b.addDecoration(bool_consts_type, spv::Decoration::DecorationArrayStride,
+                  sizeof(uint32_t));
+
   Id consts_struct_type = b.makeStructType(
       {float_consts_type, loop_consts_type, bool_consts_type}, "consts_type");
   b.addDecoration(consts_struct_type, spv::Decoration::DecorationBlock);
@@ -123,25 +132,16 @@ void SpirvShaderTranslator::StartTranslation() {
   // Constants member decorations.
   b.addMemberDecoration(consts_struct_type, 0,
                         spv::Decoration::DecorationOffset, 0);
-  b.addMemberDecoration(consts_struct_type, 0,
-                        spv::Decoration::DecorationArrayStride,
-                        4 * sizeof(float));
   b.addMemberName(consts_struct_type, 0, "float_consts");
 
   b.addMemberDecoration(consts_struct_type, 1,
                         spv::Decoration::DecorationOffset,
                         512 * 4 * sizeof(float));
-  b.addMemberDecoration(consts_struct_type, 1,
-                        spv::Decoration::DecorationArrayStride,
-                        sizeof(uint32_t));
   b.addMemberName(consts_struct_type, 1, "loop_consts");
 
   b.addMemberDecoration(consts_struct_type, 2,
                         spv::Decoration::DecorationOffset,
                         512 * 4 * sizeof(float) + 32 * sizeof(uint32_t));
-  b.addMemberDecoration(consts_struct_type, 2,
-                        spv::Decoration::DecorationArrayStride,
-                        sizeof(uint32_t));
   b.addMemberName(consts_struct_type, 2, "bool_consts");
 
   consts_ = b.createVariable(spv::StorageClass::StorageClassUniform,
@@ -213,12 +213,13 @@ void SpirvShaderTranslator::StartTranslation() {
                   b.makeArrayType(tex_t[2], b.makeUintConstant(32), 0),
                   b.makeArrayType(tex_t[3], b.makeUintConstant(32), 0)};
 
+  // Create 4 texture types, all aliased on the same binding
   for (int i = 0; i < 4; i++) {
     tex_[i] = b.createVariable(spv::StorageClass::StorageClassUniformConstant,
                                tex_a_t[i],
                                xe::format_string("textures%dD", i + 1).c_str());
     b.addDecoration(tex_[i], spv::Decoration::DecorationDescriptorSet, 1);
-    b.addDecoration(tex_[i], spv::Decoration::DecorationBinding, i);
+    b.addDecoration(tex_[i], spv::Decoration::DecorationBinding, 0);
   }
 
   // Interpolators.
@@ -792,7 +793,6 @@ void SpirvShaderTranslator::ProcessExecInstructionBegin(
           bool_type_, v, b.makeUintConstant(0));
 
       // Conditional branch
-      assert_true(cf_blocks_.size() > instr.dword_index + 1);
       body = &b.makeNewBlock();
       exec_cond_ = true;
       exec_skip_block_ = &b.makeNewBlock();
@@ -803,11 +803,15 @@ void SpirvShaderTranslator::ProcessExecInstructionBegin(
       b.createConditionalBranch(cond, body, exec_skip_block_);
 
       b.setBuildPoint(exec_skip_block_);
-      b.createBranch(cf_blocks_[instr.dword_index + 1].block);
+      if (!instr.is_end || cf_blocks_.size() > instr.dword_index + 1) {
+        assert_true(cf_blocks_.size() > instr.dword_index + 1);
+        b.createBranch(cf_blocks_[instr.dword_index + 1].block);
+      } else {
+        b.makeReturn(false);
+      }
     } break;
     case ParsedExecInstruction::Type::kPredicated: {
       // Branch based on p0.
-      assert_true(cf_blocks_.size() > instr.dword_index + 1);
       body = &b.makeNewBlock();
       exec_cond_ = true;
       exec_skip_block_ = &b.makeNewBlock();
@@ -821,7 +825,12 @@ void SpirvShaderTranslator::ProcessExecInstructionBegin(
       b.createConditionalBranch(cond, body, exec_skip_block_);
 
       b.setBuildPoint(exec_skip_block_);
-      b.createBranch(cf_blocks_[instr.dword_index + 1].block);
+      if (!instr.is_end || cf_blocks_.size() > instr.dword_index + 1) {
+        assert_true(cf_blocks_.size() > instr.dword_index + 1);
+        b.createBranch(cf_blocks_[instr.dword_index + 1].block);
+      } else {
+        b.makeReturn(false);
+      }
     } break;
   }
   b.setBuildPoint(body);
@@ -1122,8 +1131,10 @@ void SpirvShaderTranslator::ProcessVertexFetchInstruction(
 
   switch (instr.attributes.data_format) {
     case VertexFormat::k_8_8_8_8:
+    case VertexFormat::k_2_10_10_10:
     case VertexFormat::k_16_16:
     case VertexFormat::k_16_16_16_16:
+    case VertexFormat::k_16_16_FLOAT:
     case VertexFormat::k_16_16_16_16_FLOAT:
     case VertexFormat::k_32:
     case VertexFormat::k_32_32:
@@ -1210,6 +1221,9 @@ void SpirvShaderTranslator::ProcessVertexFetchInstruction(
           vec3_float_type_,
           std::vector<Id>({components[0], components[1], components[2]}));
     } break;
+
+    case VertexFormat::kUndefined:
+      break;
   }
 
   // Convert any integers to floats.
@@ -1393,6 +1407,12 @@ void SpirvShaderTranslator::ProcessTextureFetchInstruction(
           assert_unhandled_case(instr.dimension);
           break;
       }
+    } break;
+
+    case FetchOpcode::kSetTextureLod: {
+      // <lod register> = src1.x
+      // ... immediately after
+      // tfetch UseRegisterLOD=true
     } break;
 
     default:
@@ -1615,13 +1635,6 @@ void SpirvShaderTranslator::ProcessVectorAluInstruction(
     const ParsedAluInstruction& instr) {
   auto& b = *builder_;
 
-  // TODO: If we have identical operands, reuse previous one.
-  Id sources[3] = {0};
-  Id dest = vec4_float_zero_;
-  for (size_t i = 0; i < instr.operand_count; i++) {
-    sources[i] = LoadFromOperand(instr.operands[i]);
-  }
-
   // Close the open predicated block if this instr isn't predicated or the
   // conditions do not match.
   if (open_predicated_block_ &&
@@ -1647,6 +1660,13 @@ void SpirvShaderTranslator::ProcessVectorAluInstruction(
                            spv::SelectionControlMaskNone);
     b.createConditionalBranch(pred_cond, block, predicated_block_end_);
     b.setBuildPoint(block);
+  }
+
+  // TODO: If we have identical operands, reuse previous one.
+  Id sources[3] = {0};
+  Id dest = vec4_float_zero_;
+  for (size_t i = 0; i < instr.operand_count; i++) {
+    sources[i] = LoadFromOperand(instr.operands[i]);
   }
 
   bool close_predicated_block = false;
@@ -2028,22 +2048,6 @@ void SpirvShaderTranslator::ProcessScalarAluInstruction(
     const ParsedAluInstruction& instr) {
   auto& b = *builder_;
 
-  // TODO: If we have identical operands, reuse previous one.
-  Id sources[3] = {0};
-  Id dest = b.makeFloatConstant(0);
-  for (size_t i = 0, x = 0; i < instr.operand_count; i++) {
-    auto src = LoadFromOperand(instr.operands[i]);
-
-    // Pull components out of the vector operands and use them as sources.
-    if (instr.operands[i].component_count > 1) {
-      for (int j = 0; j < instr.operands[i].component_count; j++) {
-        sources[x++] = b.createCompositeExtract(src, float_type_, j);
-      }
-    } else {
-      sources[x++] = src;
-    }
-  }
-
   // Close the open predicated block if this instr isn't predicated or the
   // conditions do not match.
   if (open_predicated_block_ &&
@@ -2069,6 +2073,22 @@ void SpirvShaderTranslator::ProcessScalarAluInstruction(
                            spv::SelectionControlMaskNone);
     b.createConditionalBranch(pred_cond, block, predicated_block_end_);
     b.setBuildPoint(block);
+  }
+
+  // TODO: If we have identical operands, reuse previous one.
+  Id sources[3] = {0};
+  Id dest = b.makeFloatConstant(0);
+  for (size_t i = 0, x = 0; i < instr.operand_count; i++) {
+    auto src = LoadFromOperand(instr.operands[i]);
+
+    // Pull components out of the vector operands and use them as sources.
+    if (instr.operands[i].component_count > 1) {
+      for (int j = 0; j < instr.operands[i].component_count; j++) {
+        sources[x++] = b.createCompositeExtract(src, float_type_, j);
+      }
+    } else {
+      sources[x++] = src;
+    }
   }
 
   bool close_predicated_block = false;

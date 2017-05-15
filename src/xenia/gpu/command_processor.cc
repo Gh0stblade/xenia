@@ -10,6 +10,7 @@
 #include "xenia/gpu/command_processor.h"
 
 #include <algorithm>
+#include <cmath>
 
 #include "xenia/base/byte_stream.h"
 #include "xenia/base/logging.h"
@@ -134,13 +135,17 @@ void CommandProcessor::WorkerThreadMain() {
       // We spin here waiting for new ones, as the overhead of waiting on our
       // event is too high.
       PrepareForWait();
+      uint32_t loop_count = 0;
       do {
-        // TODO(benvanik): if we go longer than Nms, switch to waiting?
-        // It'll keep us from burning power.
-        // const int wait_time_ms = 5;
-        // xe::threading::Wait(write_ptr_index_event_.get(), true,
-        //                     std::chrono::milliseconds(wait_time_ms));
+        // If we spin around too much, revert to a "low-power" state.
+        if (loop_count > 500) {
+          const int wait_time_ms = 5;
+          xe::threading::Wait(write_ptr_index_event_.get(), true,
+                              std::chrono::milliseconds(wait_time_ms));
+        }
+
         xe::threading::MaybeYield();
+        loop_count++;
         write_ptr_index = write_ptr_index_.load();
       } while (worker_running_ && pending_fns_.empty() &&
                (write_ptr_index == 0xBAADF00D ||
@@ -224,6 +229,7 @@ bool CommandProcessor::SetupContext() { return true; }
 void CommandProcessor::ShutdownContext() { context_.reset(); }
 
 void CommandProcessor::InitializeRingBuffer(uint32_t ptr, uint32_t log2_size) {
+  read_ptr_index_ = 0;
   primary_buffer_ptr_ = ptr;
   primary_buffer_size_ = uint32_t(std::pow(2u, log2_size));
 }

@@ -25,9 +25,9 @@ using xe::ui::vulkan::CheckResult;
 constexpr VkDeviceSize kConstantRegisterUniformRange =
     512 * 4 * 4 + 8 * 4 + 32 * 4;
 
-BufferCache::BufferCache(RegisterFile* register_file,
+BufferCache::BufferCache(RegisterFile* register_file, Memory* memory,
                          ui::vulkan::VulkanDevice* device, size_t capacity)
-    : register_file_(register_file), device_(*device) {
+    : register_file_(register_file), memory_(memory), device_(*device) {
   transient_buffer_ = std::make_unique<ui::vulkan::CircularBuffer>(
       device,
       VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT |
@@ -110,6 +110,7 @@ BufferCache::BufferCache(RegisterFile* register_file,
   buffer_info.buffer = transient_buffer_->gpu_buffer();
   buffer_info.offset = 0;
   buffer_info.range = kConstantRegisterUniformRange;
+
   VkWriteDescriptorSet descriptor_writes[2];
   auto& vertex_uniform_binding_write = descriptor_writes[0];
   vertex_uniform_binding_write.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
@@ -147,6 +148,7 @@ BufferCache::~BufferCache() {
 }
 
 std::pair<VkDeviceSize, VkDeviceSize> BufferCache::UploadConstantRegisters(
+    VkCommandBuffer command_buffer,
     const Shader::ConstantRegisterMap& vertex_constant_register_map,
     const Shader::ConstantRegisterMap& pixel_constant_register_map,
     VkFence fence) {
@@ -174,6 +176,24 @@ std::pair<VkDeviceSize, VkDeviceSize> BufferCache::UploadConstantRegisters(
   std::memcpy(dest_ptr, &values[XE_GPU_REG_SHADER_CONSTANT_LOOP_00].u32,
               32 * 4);
   dest_ptr += 32 * 4;
+
+  transient_buffer_->Flush(offset, kConstantRegisterUniformRange);
+
+  // Append a barrier to the command buffer.
+  VkBufferMemoryBarrier barrier = {
+      VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER,
+      nullptr,
+      VK_ACCESS_HOST_WRITE_BIT,
+      VK_ACCESS_UNIFORM_READ_BIT | VK_ACCESS_SHADER_READ_BIT,
+      VK_QUEUE_FAMILY_IGNORED,
+      VK_QUEUE_FAMILY_IGNORED,
+      transient_buffer_->gpu_buffer(),
+      offset,
+      kConstantRegisterUniformRange,
+  };
+  vkCmdPipelineBarrier(command_buffer, VK_PIPELINE_STAGE_HOST_BIT,
+                       VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, nullptr, 1,
+                       &barrier, 0, nullptr);
 
   return {offset, offset};
 
@@ -229,14 +249,21 @@ std::pair<VkDeviceSize, VkDeviceSize> BufferCache::UploadConstantRegisters(
 }
 
 std::pair<VkBuffer, VkDeviceSize> BufferCache::UploadIndexBuffer(
-    const void* source_ptr, size_t source_length, IndexFormat format,
-    VkFence fence) {
+    VkCommandBuffer command_buffer, uint32_t source_addr,
+    uint32_t source_length, IndexFormat format, VkFence fence) {
+  auto offset = FindCachedTransientData(source_addr, source_length);
+  if (offset != VK_WHOLE_SIZE) {
+    return {transient_buffer_->gpu_buffer(), offset};
+  }
+
   // Allocate space in the buffer for our data.
-  auto offset = AllocateTransientData(source_length, fence);
+  offset = AllocateTransientData(source_length, fence);
   if (offset == VK_WHOLE_SIZE) {
     // OOM.
     return {nullptr, VK_WHOLE_SIZE};
   }
+
+  const void* source_ptr = memory_->TranslatePhysical(source_addr);
 
   // Copy data into the buffer.
   // TODO(benvanik): get min/max indices and pass back?
@@ -251,28 +278,77 @@ std::pair<VkBuffer, VkDeviceSize> BufferCache::UploadIndexBuffer(
                                  source_ptr, source_length / 4);
   }
 
+  transient_buffer_->Flush(offset, source_length);
+
+  // Append a barrier to the command buffer.
+  VkBufferMemoryBarrier barrier = {
+      VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER,
+      nullptr,
+      VK_ACCESS_HOST_WRITE_BIT,
+      VK_ACCESS_INDEX_READ_BIT,
+      VK_QUEUE_FAMILY_IGNORED,
+      VK_QUEUE_FAMILY_IGNORED,
+      transient_buffer_->gpu_buffer(),
+      offset,
+      source_length,
+  };
+  vkCmdPipelineBarrier(command_buffer, VK_PIPELINE_STAGE_HOST_BIT,
+                       VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, 0, 0, nullptr, 1,
+                       &barrier, 0, nullptr);
+
+  CacheTransientData(source_addr, source_length, offset);
   return {transient_buffer_->gpu_buffer(), offset};
 }
 
 std::pair<VkBuffer, VkDeviceSize> BufferCache::UploadVertexBuffer(
-    const void* source_ptr, size_t source_length, Endian endian,
-    VkFence fence) {
+    VkCommandBuffer command_buffer, uint32_t source_addr,
+    uint32_t source_length, Endian endian, VkFence fence) {
+  auto offset = FindCachedTransientData(source_addr, source_length);
+  if (offset != VK_WHOLE_SIZE) {
+    return {transient_buffer_->gpu_buffer(), offset};
+  }
+
   // Allocate space in the buffer for our data.
-  auto offset = AllocateTransientData(source_length, fence);
+  offset = AllocateTransientData(source_length, fence);
   if (offset == VK_WHOLE_SIZE) {
     // OOM.
     return {nullptr, VK_WHOLE_SIZE};
   }
 
+  const void* source_ptr = memory_->TranslatePhysical(source_addr);
+
   // Copy data into the buffer.
   // TODO(benvanik): memcpy then use compute shaders to swap?
-  assert_true(endian == Endian::k8in32);
   if (endian == Endian::k8in32) {
     // Endian::k8in32, swap words.
     xe::copy_and_swap_32_aligned(transient_buffer_->host_base() + offset,
                                  source_ptr, source_length / 4);
+  } else if (endian == Endian::k16in32) {
+    xe::copy_and_swap_16_in_32_aligned(transient_buffer_->host_base() + offset,
+                                       source_ptr, source_length / 4);
+  } else {
+    assert_always();
   }
 
+  transient_buffer_->Flush(offset, source_length);
+
+  // Append a barrier to the command buffer.
+  VkBufferMemoryBarrier barrier = {
+      VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER,
+      nullptr,
+      VK_ACCESS_HOST_WRITE_BIT,
+      VK_ACCESS_VERTEX_ATTRIBUTE_READ_BIT,
+      VK_QUEUE_FAMILY_IGNORED,
+      VK_QUEUE_FAMILY_IGNORED,
+      transient_buffer_->gpu_buffer(),
+      offset,
+      source_length,
+  };
+  vkCmdPipelineBarrier(command_buffer, VK_PIPELINE_STAGE_HOST_BIT,
+                       VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, 0, 0, nullptr, 1,
+                       &barrier, 0, nullptr);
+
+  CacheTransientData(source_addr, source_length, offset);
   return {transient_buffer_->gpu_buffer(), offset};
 }
 
@@ -304,6 +380,24 @@ VkDeviceSize BufferCache::TryAllocateTransientData(VkDeviceSize length,
   return VK_WHOLE_SIZE;
 }
 
+VkDeviceSize BufferCache::FindCachedTransientData(uint32_t guest_address,
+                                                  uint32_t guest_length) {
+  uint64_t key = uint64_t(guest_length) << 32 | uint64_t(guest_address);
+  auto it = transient_cache_.find(key);
+  if (it != transient_cache_.end()) {
+    return it->second;
+  }
+
+  return VK_WHOLE_SIZE;
+}
+
+void BufferCache::CacheTransientData(uint32_t guest_address,
+                                     uint32_t guest_length,
+                                     VkDeviceSize offset) {
+  uint64_t key = uint64_t(guest_length) << 32 | uint64_t(guest_address);
+  transient_cache_[key] = offset;
+}
+
 void BufferCache::Flush(VkCommandBuffer command_buffer) {
   // If we are flushing a big enough chunk queue up an event.
   // We don't want to do this for everything but often enough so that we won't
@@ -325,13 +419,13 @@ void BufferCache::Flush(VkCommandBuffer command_buffer) {
   vkFlushMappedMemoryRanges(device_, 1, &dirty_range);
 }
 
-void BufferCache::InvalidateCache() {
-  // TODO(benvanik): caching.
-}
-
+void BufferCache::InvalidateCache() { transient_cache_.clear(); }
 void BufferCache::ClearCache() { transient_cache_.clear(); }
 
-void BufferCache::Scavenge() { transient_buffer_->Scavenge(); }
+void BufferCache::Scavenge() {
+  transient_cache_.clear();
+  transient_buffer_->Scavenge();
+}
 
 }  // namespace vulkan
 }  // namespace gpu

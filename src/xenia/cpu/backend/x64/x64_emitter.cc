@@ -11,6 +11,7 @@
 
 #include <gflags/gflags.h>
 
+#include <stddef.h>
 #include <climits>
 #include <cstring>
 
@@ -669,6 +670,9 @@ static const vec128_t xmm_consts[] = {
                                          0x80000000u),
     /* XMMShortMinPS          */ vec128f(SHRT_MIN),
     /* XMMShortMaxPS          */ vec128f(SHRT_MAX),
+    /* XMMIntMin              */ vec128i(INT_MIN),
+    /* XMMIntMax              */ vec128i(INT_MAX),
+    /* XMMIntMaxPD            */ vec128d(INT_MAX),
 };
 
 // First location to try and place constants.

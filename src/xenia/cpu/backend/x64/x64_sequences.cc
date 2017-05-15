@@ -1429,21 +1429,56 @@ struct CONVERT_I32_F32
     : Sequence<CONVERT_I32_F32, I<OPCODE_CONVERT, I32Op, F32Op>> {
   static void Emit(X64Emitter& e, const EmitArgType& i) {
     // TODO(benvanik): saturation check? cvtt* (trunc?)
-    e.vcvtss2si(i.dest, i.src1);
+    if (i.instr->flags == ROUND_TO_ZERO) {
+      e.vcvttss2si(i.dest, i.src1);
+    } else {
+      e.vcvtss2si(i.dest, i.src1);
+    }
   }
 };
 struct CONVERT_I32_F64
     : Sequence<CONVERT_I32_F64, I<OPCODE_CONVERT, I32Op, F64Op>> {
   static void Emit(X64Emitter& e, const EmitArgType& i) {
-    // TODO(benvanik): saturation check? cvtt* (trunc?)
-    e.vcvttsd2si(i.dest, i.src1);
+    // Intel returns 0x80000000 if the double value does not fit within an int32
+    // PPC saturates the value instead.
+    // So, we can clamp the double value to (double)0x7FFFFFFF.
+    e.vminsd(e.xmm0, i.src1, e.GetXmmConstPtr(XMMIntMaxPD));
+    if (i.instr->flags == ROUND_TO_ZERO) {
+      e.vcvttsd2si(i.dest, e.xmm0);
+    } else {
+      e.vcvtsd2si(i.dest, e.xmm0);
+    }
   }
 };
 struct CONVERT_I64_F64
     : Sequence<CONVERT_I64_F64, I<OPCODE_CONVERT, I64Op, F64Op>> {
   static void Emit(X64Emitter& e, const EmitArgType& i) {
+    // Copy src1.
+    e.movq(e.rcx, i.src1);
+
     // TODO(benvanik): saturation check? cvtt* (trunc?)
-    e.vcvttsd2si(i.dest, i.src1);
+    if (i.instr->flags == ROUND_TO_ZERO) {
+      e.vcvttsd2si(i.dest, i.src1);
+    } else {
+      e.vcvtsd2si(i.dest, i.src1);
+    }
+
+    // 0x8000000000000000
+    e.mov(e.rax, 0x1);
+    e.shl(e.rax, 63);
+
+    // Saturate positive overflow
+    // TODO(DrChat): Find a shorter equivalent sequence.
+    // if (result ind. && src1 >= 0)
+    //   result = 0x7FFFFFFFFFFFFFFF;
+    e.cmp(e.rax, i.dest);
+    e.sete(e.al);
+    e.movzx(e.rax, e.al);
+    e.shr(e.rcx, 63);
+    e.xor_(e.rcx, 0x01);
+    e.and_(e.rax, e.rcx);
+
+    e.sub(i.dest, e.rax);
   }
 };
 struct CONVERT_F32_I32
@@ -1564,13 +1599,28 @@ struct VECTOR_CONVERT_F2I
     : Sequence<VECTOR_CONVERT_F2I,
                I<OPCODE_VECTOR_CONVERT_F2I, V128Op, V128Op>> {
   static void Emit(X64Emitter& e, const EmitArgType& i) {
-    // flags = ARITHMETIC_UNSIGNED | ARITHMETIC_UNSIGNED
-    // TODO(benvanik): are these really the same? VC++ thinks so.
-    e.vcvttps2dq(i.dest, i.src1);
-    if (i.instr->flags & ARITHMETIC_SATURATE) {
-      // TODO(benvanik): check saturation.
-      // In theory cvt throws if it saturates.
+    Xmm src1 = i.src1;
+
+    // Copy src1 if necessary.
+    bool copy_src1 = !!(i.instr->flags & ARITHMETIC_SATURATE);
+    if (copy_src1 && i.dest == i.src1) {
+      e.vmovdqa(e.xmm1, i.src1);
+      src1 = e.xmm1;
     }
+
+    e.vcvttps2dq(i.dest, i.src1);
+    if (i.instr->flags & ARITHMETIC_SATURATE &&
+        !(i.instr->flags & ARITHMETIC_UNSIGNED)) {
+      // if dest is indeterminate and i.src1 >= 0 (i.e. !(i.src1 & 0x80000000))
+      //   i.dest = 0x7FFFFFFF
+      e.vpcmpeqd(e.xmm0, i.dest, e.GetXmmConstPtr(XMMIntMin));
+      e.vpandn(e.xmm0, src1, e.xmm0);
+
+      // (high bit of xmm0 = is ind. && i.src1 >= 0)
+      e.vblendvps(i.dest, i.dest, e.GetXmmConstPtr(XMMIntMax), e.xmm0);
+    }
+
+    // TODO(DrChat): Unsigned saturation!
   }
 };
 EMITTER_OPCODE_TABLE(OPCODE_VECTOR_CONVERT_F2I, VECTOR_CONVERT_F2I);

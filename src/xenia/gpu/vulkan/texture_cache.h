@@ -20,6 +20,7 @@
 #include "xenia/gpu/vulkan/vulkan_command_processor.h"
 #include "xenia/gpu/xenos.h"
 #include "xenia/ui/vulkan/circular_buffer.h"
+#include "xenia/ui/vulkan/fenced_pools.h"
 #include "xenia/ui/vulkan/vulkan.h"
 #include "xenia/ui/vulkan/vulkan_device.h"
 
@@ -37,10 +38,6 @@ class TextureCache {
     TextureInfo texture_info;
     std::vector<std::unique_ptr<TextureView>> views;
 
-    // True if we know all info about this texture, false otherwise.
-    // (e.g. we resolve to system memory and may not know the full details about
-    // this texture)
-    bool is_full_texture;
     VkFormat format;
     VkImage image;
     VkImageLayout image_layout;
@@ -92,8 +89,6 @@ class TextureCache {
       const std::vector<Shader::TextureBinding>& vertex_bindings,
       const std::vector<Shader::TextureBinding>& pixel_bindings);
 
-  // TODO(benvanik): UploadTexture.
-  // TODO(benvanik): Resolve.
   // TODO(benvanik): ReadTexture.
 
   // Looks for a texture either containing or matching these parameters.
@@ -106,17 +101,9 @@ class TextureCache {
                          VkOffset2D* out_offset = nullptr);
 
   // Demands a texture for the purpose of resolving from EDRAM. This either
-  // creates a new texture or returns a previously created texture. texture_info
-  // is not required to be completely filled out, just guest_address and all
-  // sizes.
-  //
-  // It's possible that this may return an image that is larger than the
-  // requested size (e.g. resolving into a bigger texture) or an image that
-  // must have an offset applied. If so, the caller must handle this.
-  // At the very least, it's guaranteed that the image will be large enough to
-  // hold the requested size.
+  // creates a new texture or returns a previously created texture.
   Texture* DemandResolveTexture(const TextureInfo& texture_info,
-                                TextureFormat format, VkOffset2D* out_offset);
+                                TextureFormat format);
 
   // Clears all cached content.
   void ClearCache();
@@ -132,6 +119,9 @@ class TextureCache {
     SamplerInfo sampler_info;
     VkSampler sampler;
   };
+
+  void SetupEmptySet();
+  void DestroyEmptySet();
 
   // Allocates a new texture and memory to back it on the GPU.
   Texture* AllocateTexture(const TextureInfo& texture_info);
@@ -165,6 +155,8 @@ class TextureCache {
                          VkFence completion_fence, Texture* dest,
                          const TextureInfo& src);
 
+  void HashTextureBindings(XXH64_state_t* hash_state, uint32_t& fetch_mask,
+                           const std::vector<Shader::TextureBinding>& bindings);
   bool SetupTextureBindings(
       VkCommandBuffer command_buffer, VkFence completion_fence,
       UpdateSetInfo* update_set_info,
@@ -174,6 +166,9 @@ class TextureCache {
                            UpdateSetInfo* update_set_info,
                            const Shader::TextureBinding& binding);
 
+  // Removes invalidated textures from the cache, queues them for delete.
+  void RemoveInvalidatedTextures();
+
   Memory* memory_ = nullptr;
 
   RegisterFile* register_file_ = nullptr;
@@ -181,22 +176,24 @@ class TextureCache {
   ui::vulkan::VulkanDevice* device_ = nullptr;
   VkQueue device_queue_ = nullptr;
 
-  VkDescriptorPool descriptor_pool_ = nullptr;
+  std::unique_ptr<xe::ui::vulkan::DescriptorPool> descriptor_pool_ = nullptr;
+  std::unordered_map<uint64_t, VkDescriptorSet> texture_bindings_;
   VkDescriptorSetLayout texture_descriptor_set_layout_ = nullptr;
-  std::list<std::pair<VkDescriptorSet, VkFence>> in_flight_sets_;
+
+  VkImage empty_image_ = nullptr;
+  VkImageView empty_image_view_ = nullptr;
+  VkDeviceMemory empty_image_memory_ = nullptr;
+  VkSampler empty_sampler_ = nullptr;
+  VkDescriptorSet empty_set_ = nullptr;
 
   ui::vulkan::CircularBuffer staging_buffer_;
   std::unordered_map<uint64_t, Texture*> textures_;
   std::unordered_map<uint64_t, Sampler*> samplers_;
-  std::vector<Texture*> resolve_textures_;
   std::list<Texture*> pending_delete_textures_;
 
   std::mutex invalidated_textures_mutex_;
   std::vector<Texture*>* invalidated_textures_;
   std::vector<Texture*> invalidated_textures_sets_[2];
-
-  std::mutex invalidated_resolve_textures_mutex_;
-  std::vector<Texture*> invalidated_resolve_textures_;
 
   struct UpdateSetInfo {
     // Bitmap of all 32 fetch constants and whether they have been setup yet.

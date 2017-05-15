@@ -113,34 +113,42 @@ TextureCache::TextureCache(Memory* memory, RegisterFile* register_file,
       device_(device),
       staging_buffer_(device, VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
                       kStagingBufferSize) {
+  VkResult err = VK_SUCCESS;
+
   // Descriptor pool used for all of our cached descriptors.
-  VkDescriptorPoolCreateInfo descriptor_pool_info;
-  descriptor_pool_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
-  descriptor_pool_info.pNext = nullptr;
-  descriptor_pool_info.flags =
-      VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT;
-  descriptor_pool_info.maxSets = 32768;
   VkDescriptorPoolSize pool_sizes[1];
   pool_sizes[0].type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
   pool_sizes[0].descriptorCount = 32768;
-  descriptor_pool_info.poolSizeCount = 1;
-  descriptor_pool_info.pPoolSizes = pool_sizes;
-  auto err = vkCreateDescriptorPool(*device_, &descriptor_pool_info, nullptr,
-                                    &descriptor_pool_);
-  CheckResult(err, "vkCreateDescriptorPool");
+  descriptor_pool_ = std::make_unique<ui::vulkan::DescriptorPool>(
+      *device_, 32768,
+      std::vector<VkDescriptorPoolSize>(pool_sizes, std::end(pool_sizes)));
+
+  // Check some device limits
+  // On low sampler counts: Rarely would we experience over 16 unique samplers.
+  // This code could be refactored to scale up/down to the # of samplers.
+  auto& limits = device_->device_info().properties.limits;
+  if (limits.maxPerStageDescriptorSamplers < kMaxTextureSamplers ||
+      limits.maxPerStageDescriptorSampledImages < kMaxTextureSamplers) {
+    XELOGE(
+        "Physical device is unable to support required number of sampled "
+        "images! Expect instability! (maxPerStageDescriptorSamplers=%d, "
+        "maxPerStageDescriptorSampledImages=%d)",
+        limits.maxPerStageDescriptorSamplers,
+        limits.maxPerStageDescriptorSampledImages);
+    // assert_always();
+  }
 
   // Create the descriptor set layout used for rendering.
   // We always have the same number of samplers but only some are used.
-  VkDescriptorSetLayoutBinding bindings[4];
-  for (int i = 0; i < 4; ++i) {
-    auto& texture_binding = bindings[i];
-    texture_binding.binding = i;
-    texture_binding.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-    texture_binding.descriptorCount = kMaxTextureSamplers;
-    texture_binding.stageFlags =
-        VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
-    texture_binding.pImmutableSamplers = nullptr;
-  }
+  // The shaders will alias the bindings to the 4 dimensional types.
+  VkDescriptorSetLayoutBinding bindings[1];
+  bindings[0].binding = 0;
+  bindings[0].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+  bindings[0].descriptorCount = kMaxTextureSamplers;
+  bindings[0].stageFlags =
+      VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
+  bindings[0].pImmutableSamplers = nullptr;
+
   VkDescriptorSetLayoutCreateInfo descriptor_set_layout_info;
   descriptor_set_layout_info.sType =
       VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
@@ -162,6 +170,7 @@ TextureCache::TextureCache(Memory* memory, RegisterFile* register_file,
   invalidated_textures_ = &invalidated_textures_sets_[0];
 
   device_queue_ = device_->AcquireQueue();
+  SetupEmptySet();
 }
 
 TextureCache::~TextureCache() {
@@ -169,6 +178,7 @@ TextureCache::~TextureCache() {
     device_->ReleaseQueue(device_queue_);
   }
 
+  DestroyEmptySet();
   for (auto it = samplers_.begin(); it != samplers_.end(); ++it) {
     vkDestroySampler(*device_, it->second->sampler, nullptr);
     delete it->second;
@@ -177,7 +187,127 @@ TextureCache::~TextureCache() {
 
   vkDestroyDescriptorSetLayout(*device_, texture_descriptor_set_layout_,
                                nullptr);
-  vkDestroyDescriptorPool(*device_, descriptor_pool_, nullptr);
+}
+
+void TextureCache::SetupEmptySet() {
+  // Create an image first.
+  VkImageCreateInfo image_info = {};
+  image_info.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+  image_info.imageType = VK_IMAGE_TYPE_2D;
+  VkFormat format = VK_FORMAT_R8G8B8A8_UNORM;
+  image_info.tiling = VK_IMAGE_TILING_OPTIMAL;
+  image_info.usage = VK_IMAGE_USAGE_SAMPLED_BIT;
+
+  image_info.format = format;
+  image_info.extent = {1, 1, 1};
+  image_info.mipLevels = 1;
+  image_info.arrayLayers = 1;
+  image_info.samples = VK_SAMPLE_COUNT_1_BIT;
+  image_info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+  image_info.queueFamilyIndexCount = 0;
+  image_info.pQueueFamilyIndices = nullptr;
+  image_info.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+  VkImage image;
+  auto err = vkCreateImage(*device_, &image_info, nullptr, &image);
+  CheckResult(err, "vkCreateImage");
+
+  VkMemoryRequirements mem_requirements;
+  vkGetImageMemoryRequirements(*device_, image, &mem_requirements);
+
+  // TODO: Use a circular buffer or something else to allocate this memory.
+  // The device has a limited amount (around 64) of memory allocations that we
+  // can make.
+  // Now that we have the size, back the image with GPU memory.
+  auto memory = device_->AllocateMemory(mem_requirements, 0);
+  if (!memory) {
+    // Crap.
+    assert_always();
+    vkDestroyImage(*device_, image, nullptr);
+    return;
+  }
+
+  err = vkBindImageMemory(*device_, image, memory, 0);
+  CheckResult(err, "vkBindImageMemory");
+
+  VkImageViewCreateInfo view_info;
+  view_info.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+  view_info.pNext = nullptr;
+  view_info.flags = 0;
+  view_info.image = image;
+  view_info.viewType = VK_IMAGE_VIEW_TYPE_2D;
+  view_info.format = format;
+  view_info.components = {VK_COMPONENT_SWIZZLE_ONE, VK_COMPONENT_SWIZZLE_ONE,
+                          VK_COMPONENT_SWIZZLE_ONE, VK_COMPONENT_SWIZZLE_ONE};
+  view_info.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+  err = vkCreateImageView(*device_, &view_info, nullptr, &empty_image_view_);
+  CheckResult(err, "vkCreateImageView");
+
+  // Empty image is setup!
+  empty_image_ = image;
+  empty_image_memory_ = memory;
+
+  // Setup an empty sampler
+  VkSamplerCreateInfo sampler_info;
+  sampler_info.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
+  sampler_info.pNext = nullptr;
+  sampler_info.flags = 0;
+  sampler_info.magFilter = VK_FILTER_NEAREST;
+  sampler_info.minFilter = VK_FILTER_NEAREST;
+  sampler_info.mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST;
+  sampler_info.addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+  sampler_info.addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+  sampler_info.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+  sampler_info.mipLodBias = 0.f;
+  sampler_info.anisotropyEnable = VK_FALSE;
+  sampler_info.maxAnisotropy = 0.f;
+  sampler_info.compareEnable = VK_FALSE;
+  sampler_info.compareOp = VK_COMPARE_OP_NEVER;
+  sampler_info.minLod = 0.f;
+  sampler_info.maxLod = 0.f;
+  sampler_info.borderColor = VK_BORDER_COLOR_FLOAT_OPAQUE_BLACK;
+  sampler_info.unnormalizedCoordinates = VK_FALSE;
+  err = vkCreateSampler(*device_, &sampler_info, nullptr, &empty_sampler_);
+  CheckResult(err, "vkCreateSampler");
+
+  // Okay, allocate and setup an empty descriptor set.
+  VkDescriptorPool pool = descriptor_pool_->descriptor_pool();
+
+  VkDescriptorSetAllocateInfo alloc_info;
+  alloc_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+  alloc_info.pNext = nullptr;
+  alloc_info.descriptorPool = pool;
+  alloc_info.descriptorSetCount = 1;
+  alloc_info.pSetLayouts = &texture_descriptor_set_layout_;
+  vkAllocateDescriptorSets(*device_, &alloc_info, &empty_set_);
+
+  VkWriteDescriptorSet empty_write;
+  empty_write.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+  empty_write.pNext = nullptr;
+  empty_write.dstSet = empty_set_;
+  empty_write.dstBinding = 0;
+  empty_write.dstArrayElement = 0;
+  empty_write.descriptorCount = 32;
+  empty_write.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+
+  VkDescriptorImageInfo info[32];
+  std::memset(info, 0, sizeof(info));
+  for (int i = 0; i < 32; i++) {
+    info[i].imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    info[i].imageView = empty_image_view_;
+    info[i].sampler = empty_sampler_;
+  }
+
+  empty_write.pImageInfo = info;
+  vkUpdateDescriptorSets(*device_, 1, &empty_write, 0, nullptr);
+}
+
+void TextureCache::DestroyEmptySet() {
+  vkFreeDescriptorSets(*device_, descriptor_pool_->descriptor_pool(), 1,
+                       &empty_set_);
+  vkDestroySampler(*device_, empty_sampler_, nullptr);
+  vkDestroyImageView(*device_, empty_image_view_, nullptr);
+  vkDestroyImage(*device_, empty_image_, nullptr);
+  vkFreeMemory(*device_, empty_image_memory_, nullptr);
 }
 
 TextureCache::Texture* TextureCache::AllocateTexture(
@@ -218,9 +348,8 @@ TextureCache::Texture* TextureCache::AllocateTexture(
   // Check the device limits for the format before we create it.
   VkFormatProperties props;
   vkGetPhysicalDeviceFormatProperties(*device_, format, &props);
-  uint32_t required_flags = VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT |
-                            VK_FORMAT_FEATURE_BLIT_DST_BIT |
-                            VK_FORMAT_FEATURE_BLIT_SRC_BIT;
+  uint32_t required_flags =
+      VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT | VK_FORMAT_FEATURE_BLIT_SRC_BIT;
   if ((props.optimalTilingFeatures & required_flags) != required_flags) {
     // Texture needs conversion on upload to a native format.
     // assert_always();
@@ -301,19 +430,26 @@ bool TextureCache::FreeTexture(Texture* texture) {
 }
 
 TextureCache::Texture* TextureCache::DemandResolveTexture(
-    const TextureInfo& texture_info, TextureFormat format,
-    VkOffset2D* out_offset) {
-  // Check to see if we've already used a texture at this location.
-  auto texture = LookupAddress(
-      texture_info.guest_address, texture_info.size_2d.block_width,
-      texture_info.size_2d.block_height, format, out_offset);
-  if (texture) {
-    return texture;
+    const TextureInfo& texture_info, TextureFormat format) {
+  auto texture_hash = texture_info.hash();
+  for (auto it = textures_.find(texture_hash); it != textures_.end(); ++it) {
+    if (it->second->texture_info == texture_info) {
+      if (it->second->pending_invalidation) {
+        // This texture has been invalidated!
+        RemoveInvalidatedTextures();
+        break;
+      }
+
+      // Tell the trace writer to "cache" this memory (but not read it)
+      trace_writer_->WriteMemoryReadCachedNop(texture_info.guest_address,
+                                              texture_info.input_length);
+
+      return it->second;
+    }
   }
 
   // No texture at this location. Make a new one.
-  texture = AllocateTexture(texture_info);
-  texture->is_full_texture = false;
+  auto texture = AllocateTexture(texture_info);
 
   // Setup a debug name for the texture.
   device_->DbgSetObjectName(
@@ -321,7 +457,7 @@ TextureCache::Texture* TextureCache::DemandResolveTexture(
       VK_DEBUG_REPORT_OBJECT_TYPE_IMAGE_EXT,
       xe::format_string(
           "0x%.8X - 0x%.8X", texture_info.guest_address,
-          texture_info.guest_address + texture_info.output_length));
+          texture_info.guest_address + texture_info.input_length));
 
   // Setup an access watch. If this texture is touched, it is destroyed.
   texture->access_watch_handle = memory_->AddPhysicalAccessWatch(
@@ -332,16 +468,18 @@ TextureCache::Texture* TextureCache::DemandResolveTexture(
         auto touched_texture = reinterpret_cast<Texture*>(data_ptr);
         // Clear watch handle first so we don't redundantly
         // remove.
+        assert_not_zero(touched_texture->access_watch_handle);
         touched_texture->access_watch_handle = 0;
         touched_texture->pending_invalidation = true;
+
         // Add to pending list so Scavenge will clean it up.
-        self->invalidated_resolve_textures_mutex_.lock();
-        self->invalidated_resolve_textures_.push_back(touched_texture);
-        self->invalidated_resolve_textures_mutex_.unlock();
+        self->invalidated_textures_mutex_.lock();
+        self->invalidated_textures_->push_back(touched_texture);
+        self->invalidated_textures_mutex_.unlock();
       },
       this, texture);
 
-  resolve_textures_.push_back(texture);
+  textures_[texture_hash] = texture;
   return texture;
 }
 
@@ -354,53 +492,14 @@ TextureCache::Texture* TextureCache::Demand(const TextureInfo& texture_info,
     if (it->second->texture_info == texture_info) {
       if (it->second->pending_invalidation) {
         // This texture has been invalidated!
-        Scavenge();
+        RemoveInvalidatedTextures();
         break;
       }
 
+      trace_writer_->WriteMemoryReadCached(texture_info.guest_address,
+                                           texture_info.input_length);
+
       return it->second;
-    }
-  }
-
-  // Check resolve textures.
-  for (auto it = resolve_textures_.begin(); it != resolve_textures_.end();
-       ++it) {
-    auto texture = (*it);
-    if (texture_info.guest_address == texture->texture_info.guest_address &&
-        texture_info.size_2d.logical_width ==
-            texture->texture_info.size_2d.logical_width &&
-        texture_info.size_2d.logical_height ==
-            texture->texture_info.size_2d.logical_height) {
-      // Exact match.
-      // TODO: Lazy match (at an offset)
-      // Upgrade this texture to a full texture.
-      texture->is_full_texture = true;
-      texture->texture_info = texture_info;
-
-      if (texture->access_watch_handle) {
-        memory_->CancelAccessWatch(texture->access_watch_handle);
-      }
-
-      texture->access_watch_handle = memory_->AddPhysicalAccessWatch(
-          texture_info.guest_address, texture_info.input_length,
-          cpu::MMIOHandler::kWatchWrite,
-          [](void* context_ptr, void* data_ptr, uint32_t address) {
-            auto self = reinterpret_cast<TextureCache*>(context_ptr);
-            auto touched_texture = reinterpret_cast<Texture*>(data_ptr);
-            // Clear watch handle first so we don't redundantly
-            // remove.
-            touched_texture->access_watch_handle = 0;
-            touched_texture->pending_invalidation = true;
-            // Add to pending list so Scavenge will clean it up.
-            self->invalidated_textures_mutex_.lock();
-            self->invalidated_textures_->push_back(touched_texture);
-            self->invalidated_textures_mutex_.unlock();
-          },
-          this, texture);
-
-      textures_[texture_hash] = *it;
-      it = resolve_textures_.erase(it);
-      return textures_[texture_hash];
     }
   }
 
@@ -417,6 +516,9 @@ TextureCache::Texture* TextureCache::Demand(const TextureInfo& texture_info,
     assert_always();
     return nullptr;
   }
+
+  trace_writer_->WriteMemoryRead(texture_info.guest_address,
+                                 texture_info.input_length);
 
   bool uploaded = false;
   switch (texture_info.dimension) {
@@ -453,22 +555,6 @@ TextureCache::Texture* TextureCache::Demand(const TextureInfo& texture_info,
           "0x%.8X - 0x%.8X", texture_info.guest_address,
           texture_info.guest_address + texture_info.output_length));
 
-  // Copy in overlapping resolve textures.
-  // FIXME: RDR appears to take textures from small chunks of a resolve texture?
-  if (texture_info.dimension == Dimension::k2D) {
-    for (auto it = resolve_textures_.begin(); it != resolve_textures_.end();
-         ++it) {
-      auto texture = (*it);
-      if (texture_info.guest_address >= texture->texture_info.guest_address &&
-          texture_info.guest_address < texture->texture_info.guest_address +
-                                           texture->texture_info.input_length) {
-        // Lazy matched a resolve texture. Copy it in and destroy it.
-        // Future resolves will just copy directly into this texture.
-        // assert_always();
-      }
-    }
-  }
-
   // Though we didn't find an exact match, that doesn't mean we're out of the
   // woods yet. This texture could either be a portion of another texture or
   // vice versa. Copy any overlapping textures into this texture.
@@ -489,6 +575,7 @@ TextureCache::Texture* TextureCache::Demand(const TextureInfo& texture_info,
         auto touched_texture = reinterpret_cast<Texture*>(data_ptr);
         // Clear watch handle first so we don't redundantly
         // remove.
+        assert_not_zero(touched_texture->access_watch_handle);
         touched_texture->access_watch_handle = 0;
         touched_texture->pending_invalidation = true;
         // Add to pending list so Scavenge will clean it up.
@@ -548,10 +635,10 @@ TextureCache::TextureView* TextureCache::DemandView(Texture* texture,
       swiz_component_map[(swizzle >> 9) & 0x7],
   };
   view_info.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
-  if (texture->format == VK_FORMAT_D24_UNORM_S8_UINT) {
-    // This applies to any depth/stencil format, but we only use D24S8.
-    view_info.subresourceRange.aspectMask =
-        VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT;
+  if (texture->format == VK_FORMAT_D24_UNORM_S8_UINT ||
+      texture->format == VK_FORMAT_D32_SFLOAT_S8_UINT) {
+    // This applies to any depth/stencil format, but we only use D24S8 / D32FS8.
+    view_info.subresourceRange.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT;
   }
 
   if (texture->texture_info.dimension == Dimension::kCube) {
@@ -589,7 +676,6 @@ TextureCache::Sampler* TextureCache::Demand(const SamplerInfo& sampler_info) {
   VkResult status = VK_SUCCESS;
 
   // Create a new sampler and cache it.
-  // TODO: Actually set the properties
   VkSamplerCreateInfo sampler_create_info;
   sampler_create_info.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
   sampler_create_info.pNext = nullptr;
@@ -661,7 +747,7 @@ TextureCache::Sampler* TextureCache::Demand(const SamplerInfo& sampler_info) {
   sampler_create_info.addressModeW =
       address_mode_map[static_cast<int>(sampler_info.clamp_w)];
 
-  sampler_create_info.mipLodBias = 0.0f;
+  sampler_create_info.mipLodBias = sampler_info.lod_bias;
 
   float aniso = 0.f;
   switch (sampler_info.aniso_filter) {
@@ -752,23 +838,6 @@ TextureCache::Texture* TextureCache::LookupAddress(uint32_t guest_address,
     }
   }
 
-  // Check resolve textures
-  for (auto it = resolve_textures_.begin(); it != resolve_textures_.end();
-       ++it) {
-    const auto& texture_info = (*it)->texture_info;
-    if (texture_info.guest_address == guest_address &&
-        texture_info.dimension == Dimension::k2D &&
-        texture_info.size_2d.input_width == width &&
-        texture_info.size_2d.input_height == height) {
-      if (out_offset) {
-        out_offset->x = 0;
-        out_offset->y = 0;
-      }
-
-      return (*it);
-    }
-  }
-
   return nullptr;
 }
 
@@ -843,7 +912,26 @@ void TextureCache::ConvertTexture1D(uint8_t* dest, const TextureInfo& src) {
 void TextureCache::ConvertTexture2D(uint8_t* dest, const TextureInfo& src) {
   void* host_address = memory_->TranslatePhysical(src.guest_address);
   if (!src.is_tiled) {
-    if (src.size_2d.input_pitch == src.size_2d.output_pitch) {
+    uint32_t offset_x, offset_y;
+    if (src.has_packed_mips &&
+        TextureInfo::GetPackedTileOffset(src, &offset_x, &offset_y)) {
+      uint32_t bytes_per_block = src.format_info->block_width *
+                                 src.format_info->block_height *
+                                 src.format_info->bits_per_pixel / 8;
+
+      const uint8_t* src_mem = reinterpret_cast<const uint8_t*>(host_address);
+      src_mem += offset_y * src.size_2d.input_pitch;
+      src_mem += offset_x * bytes_per_block;
+      uint32_t pitch =
+          std::min(src.size_2d.input_pitch, src.size_2d.output_pitch);
+      for (uint32_t y = 0;
+           y < std::min(src.size_2d.block_height, src.size_2d.logical_height);
+           y++) {
+        TextureSwap(src.endianness, dest, src_mem, pitch);
+        src_mem += src.size_2d.input_pitch;
+        dest += src.size_2d.output_pitch;
+      }
+    } else if (src.size_2d.input_pitch == src.size_2d.output_pitch) {
       // Fast path copy entire image.
       TextureSwap(src.endianness, dest, host_address, src.output_length);
     } else {
@@ -1077,8 +1165,7 @@ bool TextureCache::UploadTexture2D(VkCommandBuffer command_buffer,
   barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
   barrier.pNext = nullptr;
   barrier.srcAccessMask = 0;
-  barrier.dstAccessMask =
-      VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_HOST_WRITE_BIT;
+  barrier.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
   barrier.oldLayout = dest->image_layout;
   barrier.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
   barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
@@ -1192,10 +1279,44 @@ bool TextureCache::UploadTextureCube(VkCommandBuffer command_buffer,
   return true;
 }
 
+void TextureCache::HashTextureBindings(
+    XXH64_state_t* hash_state, uint32_t& fetch_mask,
+    const std::vector<Shader::TextureBinding>& bindings) {
+  for (auto& binding : bindings) {
+    uint32_t fetch_bit = 1 << binding.fetch_constant;
+    if (fetch_mask & fetch_bit) {
+      // We've covered this binding.
+      continue;
+    }
+
+    auto& regs = *register_file_;
+    int r = XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0 + binding.fetch_constant * 6;
+    auto group =
+        reinterpret_cast<const xenos::xe_gpu_fetch_group_t*>(&regs.values[r]);
+    auto& fetch = group->texture_fetch;
+
+    XXH64_update(hash_state, &fetch, sizeof(fetch));
+  }
+}
+
 VkDescriptorSet TextureCache::PrepareTextureSet(
     VkCommandBuffer command_buffer, VkFence completion_fence,
     const std::vector<Shader::TextureBinding>& vertex_bindings,
     const std::vector<Shader::TextureBinding>& pixel_bindings) {
+  XXH64_state_t hash_state;
+  XXH64_reset(&hash_state, 0);
+
+  // (quickly) Generate a hash.
+  uint32_t fetch_mask = 0;
+  HashTextureBindings(&hash_state, fetch_mask, vertex_bindings);
+  HashTextureBindings(&hash_state, fetch_mask, pixel_bindings);
+  uint64_t hash = XXH64_digest(&hash_state);
+  for (auto it = texture_bindings_.find(hash); it != texture_bindings_.end();
+       ++it) {
+    // TODO(DrChat): We need to compare the bindings and ensure they're equal.
+    return it->second;
+  }
+
   // Clear state.
   auto update_set_info = &update_set_info_;
   update_set_info->has_setup_fetch_mask = 0;
@@ -1218,21 +1339,29 @@ VkDescriptorSet TextureCache::PrepareTextureSet(
     // TODO(benvanik): actually bail out here?
   }
 
-  // TODO(benvanik): reuse.
-  VkDescriptorSet descriptor_set = nullptr;
-  VkDescriptorSetAllocateInfo set_alloc_info;
-  set_alloc_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
-  set_alloc_info.pNext = nullptr;
-  set_alloc_info.descriptorPool = descriptor_pool_;
-  set_alloc_info.descriptorSetCount = 1;
-  set_alloc_info.pSetLayouts = &texture_descriptor_set_layout_;
-  auto err =
-      vkAllocateDescriptorSets(*device_, &set_alloc_info, &descriptor_set);
-  CheckResult(err, "vkAllocateDescriptorSets");
+  // Open a new batch of descriptor sets (for this frame)
+  if (!descriptor_pool_->has_open_batch()) {
+    descriptor_pool_->BeginBatch(completion_fence);
+  }
 
-  if (err != VK_SUCCESS) {
+  auto descriptor_set =
+      descriptor_pool_->AcquireEntry(texture_descriptor_set_layout_);
+  if (!descriptor_set) {
     return nullptr;
   }
+
+  // Copy in empty descriptors first
+  VkCopyDescriptorSet empty_copy;
+  empty_copy.sType = VK_STRUCTURE_TYPE_COPY_DESCRIPTOR_SET;
+  empty_copy.pNext = nullptr;
+  empty_copy.srcSet = empty_set_;
+  empty_copy.srcBinding = 0;
+  empty_copy.srcArrayElement = 0;
+  empty_copy.dstSet = descriptor_set;
+  empty_copy.dstBinding = 0;
+  empty_copy.dstArrayElement = 0;
+  empty_copy.descriptorCount = 32;
+  vkUpdateDescriptorSets(*device_, 0, nullptr, 1, &empty_copy);
 
   for (uint32_t i = 0; i < update_set_info->image_write_count; i++) {
     update_set_info->image_writes[i].dstSet = descriptor_set;
@@ -1244,7 +1373,7 @@ VkDescriptorSet TextureCache::PrepareTextureSet(
                            update_set_info->image_writes, 0, nullptr);
   }
 
-  in_flight_sets_.push_back({descriptor_set, completion_fence});
+  texture_bindings_[hash] = descriptor_set;
   return descriptor_set;
 }
 
@@ -1308,9 +1437,6 @@ bool TextureCache::SetupTextureBinding(VkCommandBuffer command_buffer,
   uint16_t swizzle = static_cast<uint16_t>(fetch.swizzle);
   auto view = DemandView(texture, swizzle);
 
-  trace_writer_->WriteMemoryRead(texture_info.guest_address,
-                                 texture_info.input_length);
-
   auto image_info =
       &update_set_info->image_infos[update_set_info->image_write_count];
   auto image_write =
@@ -1318,26 +1444,15 @@ bool TextureCache::SetupTextureBinding(VkCommandBuffer command_buffer,
   update_set_info->image_write_count++;
 
   image_write->sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-
-  switch (texture_info.dimension) {
-    case Dimension::k1D:
-      image_write->dstBinding = 0;
-      break;
-    case Dimension::k2D:
-      image_write->dstBinding = 1;
-      break;
-    case Dimension::k3D:
-      image_write->dstBinding = 2;
-      break;
-    case Dimension::kCube:
-      image_write->dstBinding = 3;
-      break;
-  }
-
+  image_write->pNext = nullptr;
+  // image_write->dstSet is set later...
+  image_write->dstBinding = 0;
   image_write->dstArrayElement = binding.fetch_constant;
   image_write->descriptorCount = 1;
   image_write->descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
   image_write->pImageInfo = image_info;
+  image_write->pBufferInfo = nullptr;
+  image_write->pTexelBufferView = nullptr;
 
   image_info->imageView = view->view;
   image_info->imageLayout = texture->image_layout;
@@ -1347,39 +1462,7 @@ bool TextureCache::SetupTextureBinding(VkCommandBuffer command_buffer,
   return true;
 }
 
-void TextureCache::ClearCache() {
-  // TODO(DrChat): Nuke everything.
-}
-
-void TextureCache::Scavenge() {
-  // Free unused descriptor sets
-  for (auto it = in_flight_sets_.begin(); it != in_flight_sets_.end();) {
-    if (vkGetFenceStatus(*device_, it->second) == VK_SUCCESS) {
-      // We can free this one.
-      vkFreeDescriptorSets(*device_, descriptor_pool_, 1, &it->first);
-      it = in_flight_sets_.erase(it);
-      continue;
-    }
-
-    // We've encountered an item that hasn't been used yet, so any items
-    // afterwards are guaranteed to be unused.
-    break;
-  }
-
-  staging_buffer_.Scavenge();
-
-  // Kill all pending delete textures.
-  if (!pending_delete_textures_.empty()) {
-    for (auto it = pending_delete_textures_.begin();
-         it != pending_delete_textures_.end();) {
-      if (!FreeTexture(*it)) {
-        break;
-      }
-
-      it = pending_delete_textures_.erase(it);
-    }
-  }
-
+void TextureCache::RemoveInvalidatedTextures() {
   // Clean up any invalidated textures.
   invalidated_textures_mutex_.lock();
   std::vector<Texture*>& invalidated_textures = *invalidated_textures_;
@@ -1398,24 +1481,37 @@ void TextureCache::Scavenge() {
 
     invalidated_textures.clear();
   }
+}
 
-  // Invalidated resolve textures.
-  invalidated_resolve_textures_mutex_.lock();
-  if (!invalidated_resolve_textures_.empty()) {
-    for (auto it = invalidated_resolve_textures_.begin();
-         it != invalidated_resolve_textures_.end(); ++it) {
-      pending_delete_textures_.push_back(*it);
+void TextureCache::ClearCache() {
+  // TODO(DrChat): Nuke everything.
+}
 
-      auto tex =
-          std::find(resolve_textures_.begin(), resolve_textures_.end(), *it);
-      if (tex != resolve_textures_.end()) {
-        resolve_textures_.erase(tex);
-      }
-    }
-
-    invalidated_resolve_textures_.clear();
+void TextureCache::Scavenge() {
+  // Close any open descriptor pool batches
+  if (descriptor_pool_->has_open_batch()) {
+    descriptor_pool_->EndBatch();
   }
-  invalidated_resolve_textures_mutex_.unlock();
+
+  // Free unused descriptor sets
+  // TODO(DrChat): These sets could persist across frames, we just need a smart
+  // way to detect if they're unused and free them.
+  texture_bindings_.clear();
+  descriptor_pool_->Scavenge();
+  staging_buffer_.Scavenge();
+
+  // Kill all pending delete textures.
+  RemoveInvalidatedTextures();
+  if (!pending_delete_textures_.empty()) {
+    for (auto it = pending_delete_textures_.begin();
+         it != pending_delete_textures_.end();) {
+      if (!FreeTexture(*it)) {
+        break;
+      }
+
+      it = pending_delete_textures_.erase(it);
+    }
+  }
 }
 
 }  // namespace vulkan
