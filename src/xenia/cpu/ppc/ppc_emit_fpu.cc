@@ -261,7 +261,7 @@ int InstrEmit_fctiwx(PPCHIRBuilder& f, const InstrData& i) {
   // TODO(benvanik): pull from FPSCR[RN]
   RoundMode round_mode = ROUND_TO_ZERO;
   Value* v = f.Convert(f.LoadFPR(i.X.RB), INT32_TYPE, round_mode);
-  v = f.Cast(f.ZeroExtend(v, INT64_TYPE), FLOAT64_TYPE);
+  v = f.Cast(f.SignExtend(v, INT64_TYPE), FLOAT64_TYPE);
   f.StoreFPR(i.X.RT, v);
   f.UpdateFPSCR(v, i.X.Rc);
   return 0;
@@ -303,7 +303,19 @@ int InstrEmit_fcmpx_(PPCHIRBuilder& f, const InstrData& i, bool ordered) {
   // TODO(benvanik): update FPCC for mffsx/etc
   // TODO(benvanik): update VXSNAN
   const uint32_t crf = i.X.RT >> 2;
-  f.UpdateCR(crf, f.LoadFPR(i.X.RA), f.LoadFPR(i.X.RB));
+  Value* ra = f.LoadFPR(i.X.RA);
+  Value* rb = f.LoadFPR(i.X.RB);
+
+  Value* nan = f.Or(f.IsNan(ra), f.IsNan(rb));
+  f.StoreContext(offsetof(PPCContext, cr0) + (4 * crf) + 3, nan);
+  Value* not_nan = f.Xor(nan, f.LoadConstantInt8(0x01));
+
+  Value* lt = f.And(not_nan, f.CompareSLT(ra, rb));
+  f.StoreContext(offsetof(PPCContext, cr0) + (4 * crf) + 0, lt);
+  Value* gt = f.And(not_nan, f.CompareSGT(ra, rb));
+  f.StoreContext(offsetof(PPCContext, cr0) + (4 * crf) + 1, gt);
+  Value* eq = f.And(not_nan, f.CompareEQ(ra, rb));
+  f.StoreContext(offsetof(PPCContext, cr0) + (4 * crf) + 2, eq);
   return 0;
 }
 int InstrEmit_fcmpo(PPCHIRBuilder& f, const InstrData& i) {
